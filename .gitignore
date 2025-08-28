@@ -1,0 +1,36 @@
+# any csv with binarized in the name
+*binarized*.csv
+
+# but allow this specific dataset for demo purposes
+!bike_binarized.csv
+
+Ignore/
+
+cached_files/
+
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.manifest
+*.spec
+
+venv/
+env/
+.venv/
+.env/
+
+.ipynb_checkpoints/
+
+*.log
+*.out
+*.tmp
+*.bak
+
+.DS_Store
+Thumbs.db
+
+.vscode/
+
