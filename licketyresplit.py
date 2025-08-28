@@ -44,13 +44,14 @@ class LicketyRESPLIT:
             If True, uses ThresholdGuessBinarizer for binarization.
             If False, requires binary input data.
     '''
-    def __init__(self, config, binarize=False, lookahead=1, multipass=True, consistent_lookahead = False, prune_style = "H", gbdt_n_est=50, gbdt_max_depth=1, optimal=False, pruning=True):
+    def __init__(self, config, binarize=False, lookahead=1, multipass=True, consistent_lookahead = False, prune_style = "H", gbdt_n_est=50, gbdt_max_depth=1, optimal=False, pruning=True, better_than_greedy=False):
         self.config = config
         self.domultipass = multipass
         self.lookahead = lookahead
         self.consistent_lookahead = consistent_lookahead # only for Z right now, could maybe expand to H
         self.lookahead_map = None
         self.prune_style = prune_style
+        self.better_than_greedy = better_than_greedy
         self.models = None
         self._n = None
         #self.X_full = None
@@ -103,27 +104,30 @@ class LicketyRESPLIT:
         self.lamN = int(round(lam * self._n))
         root_bitvector = np.ones(self._n, dtype=bool)
         if self.consistent_lookahead: self.lookahead_map = self._build_lookahead_map(depth)
-        # compute best_objective if not provided
-        best = self.config.get('best_objective')
-        if best is None:
-            # technically N / len(y) is how much you rescale by, but we only run this at the root currently
-            t0 = time.time()
-            if self.prune_style == "Z":
-                best = self.lickety_split(root_bitvector, depth, max(self.lookahead,1))  # use the lickety_split method to get the best objective, caches things, and does so faster
-            elif self.prune_style == "H":
-                best = self.lickety_tree_learner(root_bitvector, depth, max(self.lookahead-1, 0)) # if self.lookahead=0, that means greedy, but we want to do licketysplit objective initially, so we max it to 0, and 0 here actually means licketysplit. if self.lookahead=1, we want licketysplit, so we subtract 1 to get it instead of licketylicketysplit.
-            else:
-                raise ValueError("prune_style must be 'Z' or 'H'")
-            print(f"Best objective on root: {best:.6f} or {(best/self._n):.6f} and {time.time() - t0:.2f} seconds using lickety")
-            # best should be an integer now
+        if self.better_than_greedy:
+            greedy_root_obj = self.train_greedy(root_bitvector, depth)
+            obj_bound = int(greedy_root_obj)      # we'll say equal to or better than greedy
+            print(f"[better_than_greedy] greedy objective at root = {greedy_root_obj} ") 
         else:
-            if best > 1:
-                best = int(round(best))
+            best = self.config.get('best_objective') # compute best_objective if not provided
+            if best is None:
+                t0 = time.time()
+                if self.prune_style == "Z":
+                    best = self.lickety_split(root_bitvector, depth, max(self.lookahead,1))  # use the lickety_split method to get the best objective, caches things, and does so faster
+                elif self.prune_style == "H":
+                    best = self.lickety_tree_learner(root_bitvector, depth, max(self.lookahead-1, 0)) # if self.lookahead=0, that means greedy, but we want to do licketysplit objective initially, so we max it to 0, and 0 here actually means licketysplit. if self.lookahead=1, we want licketysplit, so we subtract 1 to get it instead of licketylicketysplit.
+                else:
+                    raise ValueError("prune_style must be 'Z' or 'H'")
+                print(f"Best objective on root: {best:.6f} or {(best/self._n):.6f} and {time.time() - t0:.2f} seconds using lickety")
+                # best should be an integer now
             else:
-                best = int(round(best * self._n))
-        # final Rashomon bound
-        #obj_bound = round(best * (1+mult)) # the objectives are round so we will also round here
-        obj_bound = math.ceil(best * (1 + mult)) # pretty arbituary, round may be more technically correct but expanding doesn't hurt - in practice things have just barely been outside that treefarms finds
+                if best > 1:
+                    best = int(round(best))
+                else:
+                    best = int(round(best * self._n))
+            # final Rashomon bound
+            #obj_bound = round(best * (1+mult)) # the objectives are round so we will also round here
+            obj_bound = math.ceil(best * (1 + mult)) # pretty arbituary, round may be more technically correct but expanding doesn't hurt - in practice things have just barely been outside that treefarms finds
 
         #self.models = self.construct_trie(bitvector, depth, obj_bound)
         self.trie = self.construct_trie(root_bitvector, depth, obj_bound)
