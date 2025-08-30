@@ -1,7 +1,5 @@
 from typing import List
 import numpy as np
-from sklearn.base import check_array
-
 
 class Leaf:
     __slots__ = ("prediction", "loss")

@@ -1,0 +1,21 @@
+dataset,lambda,epsilon,depth,method,label,duration_s,peak_rss_mb,delta_rss_mb,num_trees,lickety_best,lickety_obj_bound
+monk_1_example_data.csv,0.02,0.01,5,LICKETY_L0,"LicketyRESPLIT[lookahead=0H, best=lickety]",1.0284795202314854,326.05859375,137.75390625,2806594,,21
+monk_1_example_data.csv,0.02,0.01,5,LICKETY_L1,"LicketyRESPLIT[lookahead=1H, best=lickety]",2.360678344964981,346.45703125,149.9765625,4381054,,21
+monk_1_example_data.csv,0.02,0.01,5,LICKETY_L2_H_consFalse,"LicketyRESPLIT[lookahead=2H, best=lickety]",4.022834595292807,365.2578125,157.75390625,4399794,,21
+monk_1_example_data.csv,0.02,0.01,5,LICKETY_L2_Z_consFalse,"LicketyRESPLIT[lookahead=2Z, best=lickety]",3.204782735556364,373.33984375,159.91015625,4399794,,21
+monk_1_example_data.csv,0.02,0.01,5,LICKETY_L2_Z_consTrue,"LicketyRESPLIT[lookahead=2Z, best=lickety]",2.86976046487689,376.81640625,159.1015625,4381186,,21
+monk_1_example_data.csv,0.03,0.01,5,LICKETY_L0,"LicketyRESPLIT[lookahead=0H, best=lickety]",0.04245412349700928,366.49609375,153.41796875,6,,31
+monk_1_example_data.csv,0.03,0.01,5,LICKETY_L1,"LicketyRESPLIT[lookahead=1H, best=lickety]",0.2805716060101986,350.0,145.09375,14,,31
+monk_1_example_data.csv,0.03,0.01,5,LICKETY_L2_H_consFalse,"LicketyRESPLIT[lookahead=2H, best=lickety]",0.6641385070979595,344.8203125,142.8984375,14,,31
+monk_1_example_data.csv,0.03,0.01,5,LICKETY_L2_Z_consFalse,"LicketyRESPLIT[lookahead=2Z, best=lickety]",0.7542569041252136,344.765625,143.0390625,14,,31
+monk_1_example_data.csv,0.03,0.01,5,LICKETY_L2_Z_consTrue,"LicketyRESPLIT[lookahead=2Z, best=lickety]",0.37306566908955574,345.890625,143.0390625,14,,31
+monk_1_example_data.csv,0.05,0.01,5,LICKETY_L0,"LicketyRESPLIT[lookahead=0H, best=lickety]",0.023195065557956696,345.890625,143.0390625,2,,41
+monk_1_example_data.csv,0.05,0.01,5,LICKETY_L1,"LicketyRESPLIT[lookahead=1H, best=lickety]",0.13828985765576363,344.08203125,142.23046875,2,,41
+monk_1_example_data.csv,0.05,0.01,5,LICKETY_L2_H_consFalse,"LicketyRESPLIT[lookahead=2H, best=lickety]",0.3977215439081192,343.890625,142.0390625,2,,41
+monk_1_example_data.csv,0.05,0.01,5,LICKETY_L2_Z_consFalse,"LicketyRESPLIT[lookahead=2Z, best=lickety]",0.4561609961092472,344.08203125,142.23046875,2,,41
+monk_1_example_data.csv,0.05,0.01,5,LICKETY_L2_Z_consTrue,"LicketyRESPLIT[lookahead=2Z, best=lickety]",0.21601784601807594,343.890625,142.0390625,2,,41
+monk_1_example_data.csv,0.1,0.01,5,LICKETY_L0,"LicketyRESPLIT[lookahead=0H, best=lickety]",0.012757163494825363,343.95703125,142.10546875,1,,57
+monk_1_example_data.csv,0.1,0.01,5,LICKETY_L1,"LicketyRESPLIT[lookahead=1H, best=lickety]",0.09160031005740166,341.921875,141.0546875,1,,57
+monk_1_example_data.csv,0.1,0.01,5,LICKETY_L2_H_consFalse,"LicketyRESPLIT[lookahead=2H, best=lickety]",0.14491967484354973,341.921875,141.0546875,1,,57
+monk_1_example_data.csv,0.1,0.01,5,LICKETY_L2_Z_consFalse,"LicketyRESPLIT[lookahead=2Z, best=lickety]",0.1528089940547943,341.921875,141.0546875,1,,57
+monk_1_example_data.csv,0.1,0.01,5,LICKETY_L2_Z_consTrue,"LicketyRESPLIT[lookahead=2Z, best=lickety]",0.07659558206796646,341.921875,141.0546875,1,,57

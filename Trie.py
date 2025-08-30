@@ -46,6 +46,22 @@ class TreeTrieNode:
     def count_trees(self):
         return sum(self.objectives.values())
 
+    def count_trees_with_objective(self, target_obj):
+        return self.objectives.get(target_obj, 0)
+
+    def count_trees_within_objective(self, max_obj, min_obj = None, inclusive = True):
+        if min_obj is None:
+            if inclusive:
+                return sum(cnt for obj, cnt in self.objectives.items() if obj <= max_obj)
+            else:
+                return sum(cnt for obj, cnt in self.objectives.items() if obj < max_obj)
+        else:
+            if inclusive:
+                return sum(cnt for obj, cnt in self.objectives.items() if min_obj <= obj <= max_obj)
+            else:
+                return sum(cnt for obj, cnt in self.objectives.items() if min_obj < obj < max_obj)
+
+
     def is_empty(self):
         return not self.objectives
 
@@ -65,7 +81,36 @@ class TreeTrieNode:
         total = self.count_trees()
         for i in range(total):
             yield self.get_ith_tree(i)
-        
+
+    def iter_trees_within_objective(self, max_obj, min_obj=None, inclusive = True):
+        sorted_implemented = False
+        total = self.count_trees()
+        for i in range(total):
+            tree = self.get_ith_tree(i)
+            obj = tree.loss
+            if min_obj is None:
+                # only upper bound
+                if inclusive:
+                    if obj <= max_obj:
+                        yield tree
+                    else:
+                        if sorted_implemented: return  # early stop (trees sorted by objective)
+                else:
+                    if obj < max_obj:
+                        yield tree
+                    else:
+                        if sorted_implemented: return  # early stop
+            else:
+                # lower & upper bounds
+                lower_ok = (obj >= min_obj) if inclusive else (obj > min_obj)
+                upper_ok = (obj <= max_obj) if inclusive else (obj < max_obj)
+
+                if not upper_ok:
+                    if sorted_implemented: return  # exceeded upper bound => done (sorted)
+                if lower_ok:
+                    yield tree
+                # else: obj is still below min bound; keep scanning until we enter the band
+
     def pick_child_for_ith_tree(self, i):
         cum = 0
         # there's not that many children so i think this linear scan is fine
@@ -169,7 +214,7 @@ class TreeTrieNode:
                     k -= total_here  # skip all trees from this split that achieve target_obj, too soon
         raise IndexError(f"Index {k} out of range for objective {target_obj} " f"(total={self.objectives.get(target_obj, 0)})")
 
-    def get_ith_tree(self, i): # i think probably i can make this be in order of objective
+    def get_ith_tree_old(self, i):
         total = self.count_trees()
         if i < 0 or i >= total:
             raise IndexError(f"Index {i} out of range (total={total})")
@@ -191,6 +236,28 @@ class TreeTrieNode:
 
         return Node(feature=child.feature, left_child=left_tree, right_child=right_tree, loss=l_obj + r_obj)
 
+    def get_ith_tree(self, i):
+        total = self.count_trees()
+        if i < 0 or i >= total:
+            raise IndexError(f"Index {i} out of range (total={total})")
+
+        cum = 0
+        target_obj = None
+        k_within = None
+        for obj in sorted(self.objectives):  # ascending objective
+            cnt = self.objectives[obj]
+            if i < cum + cnt: # if i=5, cum=2, cnt=3, i want the 6th tree, i have seen 5 so far, so i go to the next objective and then get the 0th tree there.
+                target_obj = obj
+                k_within = i - cum
+                break
+            cum += cnt
+
+        if target_obj is None:
+            raise RuntimeError("Tree out of bounds")
+
+        return self.get_kth_tree_with_objective(target_obj, k_within)
+
+
     def list_trees(self):
         result = []
         for child in self.children:
@@ -208,6 +275,37 @@ class TreeTrieNode:
                                     right_child=r_sub, loss=tot)
                         result.append(node)
         return result
+
+    def list_trees_within_objective(self, max_obj, min_obj = None, inclusive = True):
+        def _in_band(val):
+            if min_obj is None:
+                return (val <= max_obj) if inclusive else (val < max_obj)
+            if inclusive:
+                return (min_obj <= val <= max_obj)
+            else:
+                return (min_obj < val < max_obj)
+
+        result = []
+        for child in self.children:
+            if isinstance(child, Leaf):
+                if _in_band(child.loss):
+                    result.append(child)
+            else:
+                L, R = child.left, child.right
+                lefts  = L.list_trees()
+                rights = R.list_trees()
+                for l_sub, r_sub in product(lefts, rights):
+                    tot = l_sub.loss + r_sub.loss
+                    if _in_band(tot):
+                        node = Node(
+                            feature=child.feature,
+                            left_child=l_sub,
+                            right_child=r_sub,
+                            loss=tot
+                        )
+                        result.append(node)
+        return result
+
 
     def get_predictions(self, i, X):
         tree = self.get_ith_tree(i)
@@ -240,6 +338,56 @@ class TreeTrieNode:
     def get_all_predictions(self, X, stack = False):
         preds = [self.get_predictions(i, X) for i in range(self.count_trees())]
         return np.stack(preds, axis=0) if stack else preds
+
+    def count_unique_prediction_vectors(self, X=None, preds=None):      
+        if preds is None:
+            if X is None:
+                raise ValueError("Provide either `preds` or `X`.")
+            preds = self.get_all_predictions(X, stack=True)
+
+        if isinstance(preds, list):
+            preds = np.stack(preds, axis=0)
+        preds = np.asarray(preds, dtype=np.uint8)
+
+        uniq = np.unique(preds, axis=0)
+        return uniq.shape[0]
+
+    def truncated_copy(self, max_depth, budget = None):
+        # returns a deep-copied trie truncated to max_depth splits (0, leaves only) and recomputed under a smaller budget
+        new_budget = self.budget if budget is None else int(budget)
+        out = TreeTrieNode(budget=new_budget)
+
+        # keep all leaves that fit the (possibly new) budget
+        for child in self.children:
+            if isinstance(child, Leaf):
+                if child.loss <= new_budget:
+                    out.add_leaf(Leaf(prediction=child.prediction, loss=child.loss))
+
+        # if no more splits allowed, stop here
+        if max_depth <= 0:
+            return out
+
+        # otherwise, recursively truncate SplitNode children
+        for child in self.children:
+            if isinstance(child, SplitNode):
+                # recursively truncate both sides to (max_depth-1)
+                right_budget = new_budget - child.left.min_objective
+                if right_budget <= 0:
+                    continue
+                R_trunc = child.right.truncated_copy(max_depth - 1, right_budget)
+                if R_trunc.is_empty():
+                    continue
+
+                left_budget = new_budget - R_trunc.min_objective
+                if left_budget <= 0:
+                    continue
+                L_trunc = child.left.truncated_copy(max_depth - 1, left_budget)
+                if L_trunc.is_empty():
+                    continue
+
+                out.add_split(child.feature, L_trunc, R_trunc)
+
+        return out
 
 
 def structurally_equal(a, b):

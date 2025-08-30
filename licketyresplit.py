@@ -44,7 +44,7 @@ class LicketyRESPLIT:
             If True, uses ThresholdGuessBinarizer for binarization.
             If False, requires binary input data.
     '''
-    def __init__(self, config, binarize=False, lookahead=1, multipass=True, consistent_lookahead = False, prune_style = "H", gbdt_n_est=50, gbdt_max_depth=1, optimal=False, pruning=True, better_than_greedy=False):
+    def __init__(self, config, binarize=False, lookahead=1, multipass=True, consistent_lookahead = False, prune_style = "H", gbdt_n_est=50, gbdt_max_depth=1, optimal=False, pruning=True, better_than_greedy=False, try_greedy_first=False, trie_cache_strategy="compact", multiplicative_slack=0):
         self.config = config
         self.domultipass = multipass
         self.lookahead = lookahead
@@ -52,8 +52,9 @@ class LicketyRESPLIT:
         self.lookahead_map = None
         self.prune_style = prune_style
         self.better_than_greedy = better_than_greedy
-        self.models = None
         self._n = None
+        self.best = None
+        self.obj_bound = None
         #self.X_full = None
         self.X_bool = None
         self.y_full = None
@@ -67,18 +68,11 @@ class LicketyRESPLIT:
             self.enc = ThresholdGuessBinarizer(n_estimators=gbdt_n_est, max_depth=gbdt_max_depth, random_state=42)
             self.enc.set_output(transform="pandas")
             print("Finished binarization")
-        self.call_counter = 0
-        self.leaf_counter = 0
-        self.prune_counter = 0
-        self.entire_greedy_time = 0.0
-        self.greedy_cache_hits = 0
-        self.enumerate_cache_hits = 0
-        self.enumerate_depth_cache_hits = 0
-        self.left_budget_equal_count = 0
-        self.left_budget_tight_count = 0
         self.optimal = optimal
         self.pruning = pruning
-
+        self.try_greedy_first = try_greedy_first
+        self.trie_cache_strategy = trie_cache_strategy
+        self.multiplicative_slack = multiplicative_slack
     #@profile
     def fit(self, X, y):
         if self.binarize: # train binarizer
@@ -94,7 +88,6 @@ class LicketyRESPLIT:
         else:
             self.X_bool = np.empty(Xv.shape, dtype=bool, order='C')
             np.not_equal(Xv, 0, out=self.X_bool)
-        t0 = time.time()
 
         # --- unpack config ---
         self._n = len(y)
@@ -103,21 +96,17 @@ class LicketyRESPLIT:
         mult  = self.config['rashomon_bound_multiplier']
         self.lamN = int(round(lam * self._n))
         root_bitvector = np.ones(self._n, dtype=bool)
+        best = None
+        t0 = time.time()
         if self.consistent_lookahead: self.lookahead_map = self._build_lookahead_map(depth)
         if self.better_than_greedy:
             greedy_root_obj = self.train_greedy(root_bitvector, depth)
-            obj_bound = int(greedy_root_obj)      # we'll say equal to or better than greedy
+            obj_bound = int(greedy_root_obj)      # we'll say better or equal to than greedy
             print(f"[better_than_greedy] greedy objective at root = {greedy_root_obj} ") 
         else:
             best = self.config.get('best_objective') # compute best_objective if not provided
             if best is None:
-                t0 = time.time()
-                if self.prune_style == "Z":
-                    best = self.lickety_split(root_bitvector, depth, max(self.lookahead,1))  # use the lickety_split method to get the best objective, caches things, and does so faster
-                elif self.prune_style == "H":
-                    best = self.lickety_tree_learner(root_bitvector, depth, max(self.lookahead-1, 0)) # if self.lookahead=0, that means greedy, but we want to do licketysplit objective initially, so we max it to 0, and 0 here actually means licketysplit. if self.lookahead=1, we want licketysplit, so we subtract 1 to get it instead of licketylicketysplit.
-                else:
-                    raise ValueError("prune_style must be 'Z' or 'H'")
+                best = self.lickety_split(root_bitvector, depth, max(self.lookahead,1))  # use the lickety_split method to get the best objective, caches things, and does so faster
                 print(f"Best objective on root: {best:.6f} or {(best/self._n):.6f} and {time.time() - t0:.2f} seconds using lickety")
                 # best should be an integer now
             else:
@@ -129,11 +118,46 @@ class LicketyRESPLIT:
             #obj_bound = round(best * (1+mult)) # the objectives are round so we will also round here
             obj_bound = math.ceil(best * (1 + mult)) # pretty arbituary, round may be more technically correct but expanding doesn't hurt - in practice things have just barely been outside that treefarms finds
 
-        #self.models = self.construct_trie(bitvector, depth, obj_bound)
-        self.trie = self.construct_trie(root_bitvector, depth, obj_bound)
+        self.best = int(best) if best is not None else None
+        self.obj_bound = int(obj_bound)
+        
+        self.trie = self.construct_trie(root_bitvector, depth, int(math.ceil(obj_bound * (1 + self.multiplicative_slack))))
         t1 = time.time()
         print(f"[LicketyRESPLIT] Finished in {t1 - t0:.3f} seconds with {self.trie.count_trees()} trees")
         return self
+    
+    def count_trees(self, max_obj=None, min_obj=None, inclusive=True):
+        # works even with multiplicative_slack
+        if max_obj is None: max_obj = self.obj_bound
+        return self.trie.count_trees_within_objective(max_obj, min_obj=min_obj, inclusive=inclusive)
+
+    def list_trees(self, max_obj=None, min_obj=None, inclusive=True):
+        if max_obj is None: max_obj = self.obj_bound
+        return self.trie.list_trees_within_objective(max_obj=max_obj, min_obj=min_obj, inclusive=inclusive)
+
+    def iter_trees(self, max_obj=None, min_obj=None, inclusive=True):
+        if max_obj is None: max_obj = self.obj_bound
+        return self.trie.iter_trees_within_objective(max_obj=max_obj, min_obj=min_obj, inclusive=inclusive)
+
+    def iter_predictions(self, X=None, max_obj=None, min_obj=None, inclusive=True):
+        if X is None: X = self.X_bool
+        for tree in self.iter_trees(max_obj=max_obj, min_obj=min_obj, inclusive=inclusive):
+            yield TreeTrieNode._predict_tree(tree, X)
+    
+    def get_all_predictions(self, X=None, max_obj=None, min_obj=None, inclusive=True, stack=False):
+        if X is None: X = self.X_bool
+        preds = [p for p in self.iter_predictions(X, max_obj=max_obj, min_obj=min_obj, inclusive=inclusive)]
+        return np.stack(preds, axis=0) if stack and preds else preds
+
+    def count_unique_prediction_vectors(self, X=None, preds=None, max_obj=None, min_obj=None, inclusive=True):
+        if preds is None:
+            if X is None:
+                if X is None: X = self.X_bool
+            preds = self.get_all_predictions(X, max_obj=max_obj, min_obj=min_obj, inclusive=inclusive, stack=True)
+        if isinstance(preds, list):
+            preds = np.stack(preds, axis=0)
+        preds = np.asarray(preds, dtype=np.uint8)
+        return np.unique(preds, axis=0).shape[0]
 
     #@profile
     def _key_bytes(self, bv: np.ndarray):
@@ -143,12 +167,47 @@ class LicketyRESPLIT:
 
     #@profile
     def construct_trie(self, bitvector, depth, budget):
-        self.call_counter += 1
-        key = (self._key_bytes(bitvector), depth, budget)
-        if key in self.trie_cache:
-            return self.trie_cache[key]
+        bv_key  = self._key_bytes(bitvector)
+        if self.trie_cache_strategy != "compact":
+            key = (bv_key, depth, budget)
+            if key in self.trie_cache:
+                return self.trie_cache[key]
+        else:
+            entry = self.trie_cache.get(bv_key)
+            if entry is not None:
+                (d_max, b_at_d, trieD), (d_at_b, b_max, trieB) = entry
+
+                # prefer whichever qualifies as a superset; either is fine
+                if d_max >= depth and b_at_d >= budget:
+                    return trieD.truncated_copy(max_depth=depth, budget=budget)
+                if d_at_b >= depth and b_max >= budget:
+                    return trieB.truncated_copy(max_depth=depth, budget=budget)
         # if you have a greater budget or a smaller depth than an existing solution to the subproblem, you could also return that (it is subset)
-        
+        if self.trie_cache_strategy == "superset":
+            max_depth_cfg = int(self.config.get('depth_budget', depth))
+            max_budget_101 = int(math.ceil(budget * 1.01))
+            # same depth, bigger budget
+            if max_budget_101 > budget:
+                for b2 in range(budget + 1, max_budget_101 + 1):
+                    k2 = (bv_key, depth, b2)
+                    if k2 in self.trie_cache:
+                        return self.trie_cache[k2].truncated_copy(max_depth=depth, budget=budget)
+
+            # bigger depth, same budget
+            if max_depth_cfg > depth:
+                for d2 in range(depth + 1, max_depth_cfg + 1):
+                    k2 = (bv_key, d2, budget)
+                    if k2 in self.trie_cache:
+                        return self.trie_cache[k2].truncated_copy(max_depth=depth, budget=budget)
+
+            # bigger depth AND bigger budget band
+            if max_depth_cfg > depth and max_budget_101 > budget:
+                for d2 in range(depth + 1, max_depth_cfg + 1):
+                    for b2 in range(budget + 1, max_budget_101 + 1):
+                        k2 = (bv_key, d2, b2)
+                        if k2 in self.trie_cache:
+                            return self.trie_cache[k2].truncated_copy(max_depth=depth, budget=budget)
+
         trie = TreeTrieNode(budget=budget)
         N  = self._n
         
@@ -158,7 +217,7 @@ class LicketyRESPLIT:
         guaranteed_expense = self.lamN # can add to this guaranteed misclassifications (conflicting labels)
 
         if budget < guaranteed_expense: # cannot do anything at all
-            return trie
+            return trie # should never happen given that we prune
         
         # consider leaf predictions for both classes
         for pred in [0, 1]:
@@ -173,7 +232,6 @@ class LicketyRESPLIT:
         if depth == 0 or budget < guaranteed_expense+self.lamN: # now 2lambda+optionalconflictinglabels. this now says a split is pointless.
             return trie
                      
-        greedy_total_time = 0.0 
         # try every feature split
         d = self.X_bool.shape[1]
         for feat in range(d):
@@ -184,30 +242,23 @@ class LicketyRESPLIT:
             right_bitvector = np.logical_and(bitvector, np.logical_not(bf))
             if not left_bitvector.any() or not right_bitvector.any():
                 continue
-            # only explore things where greedy would get within the set
-            t_feat = time.time()
-            if self.optimal:
-                loss_l = self.objective_optimal(left_bitvector,  depth - 1)
-                loss_r = self.objective_optimal(right_bitvector, depth - 1)
-            elif self.prune_style == "Z":
-                if self.lookahead <= 0:
-                    loss_l = self.train_greedy(left_bitvector,  depth - 1)
-                    loss_r = self.train_greedy(right_bitvector, depth - 1)
+            # only explore things where some oracle would get within the set. maybe this means we should add some slack to the initial call and then trim after
+            # it may be worth it to try greedy, and if it it within the set, you don't need to ask a more expensive oracle.
+            if self.try_greedy_first:
+                loss_l  = self.train_greedy(left_bitvector,  depth - 1)
+                loss_r = self.train_greedy(right_bitvector, depth - 1)
+            if (not self.try_greedy_first) or loss_l + loss_r > budget: # if greedy is bad, we need to try the other methods, but otherwise don't.
+                if self.optimal:
+                    loss_l = self.objective_optimal(left_bitvector,  depth - 1)
+                    loss_r = self.objective_optimal(right_bitvector, depth - 1)
                 else:
-                    loss_l = self.lickety_split(left_bitvector,  depth - 1, k=self.lookahead)
-                    loss_r = self.lickety_split(right_bitvector, depth - 1, k=self.lookahead)
-            elif self.prune_style == "H":
-                if self.lookahead <= 0:
-                    loss_l = self.train_greedy(left_bitvector,  depth - 1)
-                    loss_r = self.train_greedy(right_bitvector, depth - 1)
-                else:
-                    # full H objective for each side (good for pruning; cache makes it cheap)
-                    loss_l = self.lickety_tree_learner(left_bitvector,  depth - 1, self.lookahead-1) # subtracting 1 on lookahead because here lookahead of 0 is actually licketysplit because we defined oracle 0 to be greedy instead of entropy
-                    loss_r = self.lickety_tree_learner(right_bitvector, depth - 1, self.lookahead-1)
-            else:
-                raise ValueError("prune_style must be 'Z' or 'H'")
+                    if self.lookahead <= 0:
+                        loss_l = self.train_greedy(left_bitvector,  depth - 1)
+                        loss_r = self.train_greedy(right_bitvector, depth - 1)
+                    else:
+                        loss_l = self.lickety_split(left_bitvector,  depth - 1, k=self.lookahead)
+                        loss_r = self.lickety_split(right_bitvector, depth - 1, k=self.lookahead)
 
-            greedy_total_time += (time.time() - t_feat)
             # pruning should always always be on
             if self.pruning and loss_l + loss_r > budget: # if greedy isn't within budget (which starts out epsilon loose), then we can skip this feature. greedy pruning to approxmation r-set
                  continue
@@ -222,10 +273,24 @@ class LicketyRESPLIT:
             left_trie, right_trie = result
             trie.add_split(feat, left_trie, right_trie)
 
-           
-        self.entire_greedy_time += greedy_total_time
-        #print(f"[enumerate] call {self.call_counter} | greedy_total_time = {greedy_total_time:.3f} s | len(rashomon) = {len(rashomon)}")
-        self.trie_cache[key] = trie
+        if self.trie_cache_strategy != "compact": self.trie_cache[key] = trie
+        else: 
+            old = self.trie_cache.get(bv_key)
+            if old is None:
+                # initialize both slots with this trie; ok if identical
+                self.trie_cache[bv_key] = ((depth, budget, trie), (depth, budget, trie))
+            else:
+                (d_max, b_at_d, trieD), (d_at_b, b_max, trieB) = old
+
+                # update max-depth slot
+                if depth > d_max:
+                    d_max, b_at_d, trieD = depth, budget, trie
+
+                # update max-budget slot
+                if budget > b_max:
+                    d_at_b, b_max, trieB = depth, budget, trie
+
+                self.trie_cache[bv_key] = ((d_max, b_at_d, trieD), (d_at_b, b_max, trieB))
         return trie
 
     #@profile
@@ -248,10 +313,8 @@ class LicketyRESPLIT:
 
         if left_budget > left_subset_budget: # TODO: CAN SHARE INFORMATION BETWEEN SUBTRIE AND TRIE, BUT THIS HARDLY EVER RUNS SO DOESN'T MATTER MUCH
             left_trie = self.construct_trie(left_bitvector, depth-1, left_budget) # a subset of what we want
-            self.left_budget_tight_count += 1
         else: 
             left_trie = left_subtrie # budgets were equal, will just return the same thing
-            self.left_budget_equal_count += 1
             #print("LEFT SUBSET = LEFT SET") # this happens a lot and saves time
         #left_set = left_subset # just to see if this is faster. indeed it is by a little bit
         
@@ -300,10 +363,13 @@ class LicketyRESPLIT:
 
     def _next_k(self, k):
         """Cycle K,K-1,...,1,K,... where K=self.lookahead."""
-        K = self.lookahead
-        if K <= 0:   # degenerate: always greedy. this is only used for licketysplit initial objective so we want to always keep k 1.
-            return 1
-        return (k - 1) if k > 1 else K
+        if self.prune_style == "H": return k
+        elif self.prune_style == "Z":
+            K = self.lookahead
+            if K <= 0:   # degenerate: always greedy. this is only used for licketysplit initial objective so we want to always keep k 1.
+                return 1
+            return (k - 1) if k > 1 else K
+        raise ValueError("prune_style must be 'Z' or 'H'")
 
     #@profile
     def train_greedy(self, bitvector, depth_budget):
@@ -314,7 +380,6 @@ class LicketyRESPLIT:
         reg = self.lamN # scaled integer
         key = (self._key_bytes(bitvector), depth_budget)
         if key in self.greedy_cache:
-            self.greedy_cache_hits += 1 
             return self.greedy_cache[key]
         y_train = self.y_full[bitvector]
         n_sub = y_train.size # needed for a better way to check if the mean of the subproblem is above 0.5 or not
@@ -366,7 +431,7 @@ class LicketyRESPLIT:
             k = self.lookahead_map.get(depth_budget, k)
             # cache key is now independent of input k when consistent
             key = (self._key_bytes(bitvector), int(depth_budget))
-        else:
+        else: # default Z or any H
             # original behavior (cap k by depth for caching)
             k = min(k, depth_budget)
             if self.lookahead > 1:
@@ -490,70 +555,6 @@ class LicketyRESPLIT:
         valid_idx = np.where(valid)[0]
         best_idx  = int(valid_idx[np.argmax(gain_valid)])
         return best_idx
-
-    def oracle_obj(self, bitvector, depth_budget, L): # the choice of oracle is based on L
-        # L=0 is greedy. L=1 is licketysplit. L=2 is choosing the best split based on how LicketySPLIT would finish it, ...
-        if depth_budget <= 0:
-            return self.train_greedy(bitvector, 0)
-        if L <= 0:
-            return self.train_greedy(bitvector, depth_budget)
-
-        return self.lickety_tree_learner(bitvector, depth_budget, L-1)
-
-    def lickety_tree_learner(self, bitvector, depth_budget, L):
-        # need to think more on if we can clamp L in the same way for caching purposes
-        if depth_budget <= 0:
-            return self.train_greedy(bitvector, 0)
-
-        key = (self._key_bytes(bitvector), depth_budget, L)
-        if key in self.lickety_cache:
-            return self.lickety_cache[key]
-
-        y_subset = self.y_full[bitvector]
-        n_sub = y_subset.size
-        pos = int(y_subset.sum())
-        errors = min(pos, n_sub - pos)
-        leaf_loss = self.lamN + errors
-
-        if leaf_loss <= 2 * self.lamN:
-            self.lickety_cache[key] = leaf_loss
-            return leaf_loss
-
-        best_feat = None
-        best_loss_est = float("inf")
-        best_lr = (None, None)
-
-        D = self.X_bool.shape[1]
-        for feat in range(D):
-            bf = self.X_bool[:, feat]
-            left  = np.logical_and(bitvector, bf)
-            right = np.logical_and(bitvector, np.logical_not(bf))
-            if not left.any() or not right.any():
-                continue
-
-            # score candidate split using the oracle (note oracle uses L-1)
-            est_l = self.oracle_obj(left,  depth_budget - 1, L)
-            est_r = self.oracle_obj(right, depth_budget - 1, L)
-            total_est = est_l + est_r
-
-            if total_est < best_loss_est:
-                best_loss_est = total_est
-                best_feat = feat
-                best_lr = (left, right)
-
-        if best_feat is None or best_loss_est >= leaf_loss:
-            self.lickety_cache[key] = leaf_loss
-            return leaf_loss
-
-        # commit the chosen split and recurse on both sides with the SAME L (it just specifies the oracle)
-        left_loss  = self.lickety_tree_learner(best_lr[0], depth_budget - 1, L)
-        right_loss = self.lickety_tree_learner(best_lr[1], depth_budget - 1, L)
-        obj = left_loss + right_loss
-
-        self.lickety_cache[key] = obj
-        return obj
-
-
 
     def objective_optimal(self, bitvector, depth_budget):
         if not np.any(bitvector):
