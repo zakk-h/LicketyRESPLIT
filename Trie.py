@@ -83,7 +83,6 @@ class TreeTrieNode:
             yield self.get_ith_tree(i)
 
     def iter_trees_within_objective(self, max_obj, min_obj=None, inclusive = True):
-        sorted_implemented = False
         total = self.count_trees()
         for i in range(total):
             tree = self.get_ith_tree(i)
@@ -94,19 +93,19 @@ class TreeTrieNode:
                     if obj <= max_obj:
                         yield tree
                     else:
-                        if sorted_implemented: return  # early stop (trees sorted by objective)
+                        return  # early stop (trees sorted by objective)
                 else:
                     if obj < max_obj:
                         yield tree
                     else:
-                        if sorted_implemented: return  # early stop
+                        return  # early stop
             else:
                 # lower & upper bounds
                 lower_ok = (obj >= min_obj) if inclusive else (obj > min_obj)
                 upper_ok = (obj <= max_obj) if inclusive else (obj < max_obj)
 
                 if not upper_ok:
-                    if sorted_implemented: return  # exceeded upper bound => done (sorted)
+                    return  # exceeded upper bound => done (sorted)
                 if lower_ok:
                     yield tree
                 # else: obj is still below min bound; keep scanning until we enter the band

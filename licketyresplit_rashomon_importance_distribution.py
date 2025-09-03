@@ -1,4 +1,5 @@
 import os
+import math
 import numpy as np
 import pickle
 import json
@@ -92,7 +93,7 @@ class RashomonImportanceDistribution:
             verbose=False,
             vi_metric='sub_mr',
             max_par_for_gosdt=5,
-            allow_binarize_internally=False):
+            allow_binarize_internally=False, lickety_lookahead = 1):
 
         supported_vis = ['sub_mr', 'div_mr', 'sub_cmr', 'div_cmr', 'shap']
         assert vi_metric in supported_vis, \
@@ -127,6 +128,7 @@ class RashomonImportanceDistribution:
         self.rashomon_output_dir = rashomon_output_dir
         self.verbose = verbose
         self.max_par_for_gosdt = max_par_for_gosdt
+        self.lickety_lookahead = lickety_lookahead
 
         try:
             self.num_cpus = os.cpu_count()
@@ -156,7 +158,7 @@ class RashomonImportanceDistribution:
         self._compute_and_aggregate_vis()
 
         self.vi_dataframe = self._read_vis_to_construct_rid(
-            file_paths=[os.path.join(self.cache_dir, f'lickety_{self.vi_metric}s_bootstrap_{i}_eps_{eps}_db_{db}_reg_{lam}.pickle') for i in range(n_resamples)],
+            file_paths=[os.path.join(self.cache_dir, f'lickety_{self.vi_metric}s_bootstrap_{i}_eps_{eps}_db_{db}_reg_{lam}_lh_{self.lickety_lookahead}.pickle') for i in range(n_resamples)],
             n_vars=self.n_vars
         )
         self.rid_with_counts = self._get_df_with_counts()
@@ -186,7 +188,7 @@ class RashomonImportanceDistribution:
         rset_path = os.path.join(
             self.cache_dir,
             self.rashomon_output_dir,
-            f'lickety_trie_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}.pkl'
+            f'lickety_trie_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}_lh_{self.lickety_lookahead}.pkl'
         )
 
         if os.path.isfile(rset_path):
@@ -209,14 +211,16 @@ class RashomonImportanceDistribution:
         model = LicketyRESPLIT(
             config=config,
             binarize=False, # we’re already binarized upstream
-            greedy_lookahead=False,
+            lookahead=self.lickety_lookahead,
             multipass=True
         )
         model.fit(X, y)  # builds model.trie (TreeTrieNode)
 
+        trie_trunc = model.trie.truncated_copy(max_depth=int(self.db - 1), budget=int(math.ceil(model.trie.min_objective * (1.0 + self.eps))))
+
         # some of this stuff may not be needed
         artifact = {
-            "trie": model.trie,
+            "trie": trie_trunc,
             "feature_names": list(X.columns),
             "config": config,
             "lamN": getattr(model, "lamN", None),
@@ -312,7 +316,7 @@ class RashomonImportanceDistribution:
                     else:
                         target_div_model_reliances[var][mr] = cur_model_reliance[var][mr]
 
-            with open(os.path.join(self.cache_dir, f'lickety_div_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}.pickle'), 'wb') as f:
+            with open(os.path.join(self.cache_dir, f'lickety_div_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}_lh_{self.lickety_lookahead}.pickle'), 'wb') as f:
                 pickle.dump(target_div_model_reliances, f, protocol=pickle.HIGHEST_PROTOCOL)
 
             cur_model_reliance = val[1]
@@ -325,7 +329,7 @@ class RashomonImportanceDistribution:
                     else:
                         target_sub_model_reliances[var][mr] = cur_model_reliance[var][mr]
 
-            with open(os.path.join(self.cache_dir, f'lickety_sub_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}.pickle'), 'wb') as f:
+            with open(os.path.join(self.cache_dir, f'lickety_sub_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}_lh_{self.lickety_lookahead}.pickle'), 'wb') as f:
                 pickle.dump(target_sub_model_reliances, f, protocol=pickle.HIGHEST_PROTOCOL)
             
         if self.verbose:
@@ -349,8 +353,8 @@ class RashomonImportanceDistribution:
             bootstrap_ind : int
                 The index of the current bootstrap
         '''
-        if os.path.isfile(os.path.join(self.cache_dir, f'lickety_div_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}.pickle'))\
-            and os.path.isfile(os.path.join(self.cache_dir, f'lickety_sub_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}.pickle')):
+        if os.path.isfile(os.path.join(self.cache_dir, f'lickety_div_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}_lh_{self.lickety_lookahead}.pickle'))\
+            and os.path.isfile(os.path.join(self.cache_dir, f'lickety_sub_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}_lh_{self.lickety_lookahead}.pickle')):
             return None
 
         div_model_reliances = [{'means':[]} for i in range(self.n_vars)]
@@ -359,7 +363,7 @@ class RashomonImportanceDistribution:
         resampled_df = pd.read_csv(os.path.join(self.cache_dir, f'tmp_bootstrap_{bootstrap_ind}.csv'))
         trie_path = os.path.join(self.cache_dir, 
                         self.rashomon_output_dir, 
-                        f'lickety_trie_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}.pkl')
+                        f'lickety_trie_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}_lh_{self.lickety_lookahead}.pkl')
                         
         with open(trie_path, 'rb') as f:
             artifact = pickle.load(f)

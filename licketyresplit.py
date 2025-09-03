@@ -123,20 +123,20 @@ class LicketyRESPLIT:
         
         self.trie = self.construct_trie(root_bitvector, depth, int(math.ceil(obj_bound * (1 + self.multiplicative_slack))))
         t1 = time.time()
-        print(f"[LicketyRESPLIT] Finished in {t1 - t0:.3f} seconds with {self.trie.count_trees()} trees")
+        print(f"[LicketyRESPLIT] Finished in {t1 - t0:.3f} seconds with {self.trie.count_trees()} trees (truncated to {self.count_trees()})")
         return self
     
     def count_trees(self, max_obj=None, min_obj=None, inclusive=True):
         # works even with multiplicative_slack
-        if max_obj is None: max_obj = self.obj_bound
+        if max_obj is None: max_obj = int(math.ceil(self.trie.min_objective*(1+self.config['rashomon_bound_multiplier']))) # more authentic because best could have improved
         return self.trie.count_trees_within_objective(max_obj, min_obj=min_obj, inclusive=inclusive)
 
     def list_trees(self, max_obj=None, min_obj=None, inclusive=True):
-        if max_obj is None: max_obj = self.obj_bound
+        if max_obj is None: max_obj = int(math.ceil(self.trie.min_objective*(1+self.config['rashomon_bound_multiplier'])))
         return self.trie.list_trees_within_objective(max_obj=max_obj, min_obj=min_obj, inclusive=inclusive)
 
     def iter_trees(self, max_obj=None, min_obj=None, inclusive=True):
-        if max_obj is None: max_obj = self.obj_bound
+        if max_obj is None: max_obj = int(math.ceil(self.trie.min_objective*(1+self.config['rashomon_bound_multiplier'])))
         return self.trie.iter_trees_within_objective(max_obj=max_obj, min_obj=min_obj, inclusive=inclusive)
 
     def iter_predictions(self, X=None, max_obj=None, min_obj=None, inclusive=True):

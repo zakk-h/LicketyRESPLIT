@@ -13,9 +13,6 @@ from licketyresplit import LicketyRESPLIT
 from treefarms import TREEFARMS
 from gosdt import GOSDTClassifier
 
-
-
-## TreeFARMS Attempts
 def structurally_equal(a, b):
     if type(a) != type(b):
         return False
@@ -37,6 +34,8 @@ def tree_structure_signature(tree):  # hashable nested tuples
                 tree_structure_signature(tree.right_child))
     raise ValueError(f"Unknown tree type: {type(tree)}")
 
+## TreeFARMS Attempts
+
 def _collect_trees_from_treefarms(model, max_try=100000):
     trees, i = [], 0
     while i < max_try:
@@ -54,17 +53,13 @@ def _tree_errors(tree, X, y):
     if hasattr(tree, "score"):
         acc = float(tree.score(X, y))
         return int(round((1.0 - acc) * N)), acc
-    raise RuntimeError("Tree does not expose .score(X,y)")
 
 def _num_leaves(tree):
     if hasattr(tree, "leaves"):
         return int(getattr(tree, "leaves")())
-    raise RuntimeError("Tree does not expose leaves()/num_leaves().")
 
 def summarize_treefarms_objectives(model, X, y, reg, epsilon=0.01):
     trees = _collect_trees_from_treefarms(model)
-    if not trees:
-        raise RuntimeError("No trees retrieved from TREEFARMS (indexing/iter failed).")
 
     N = len(y)
     lamN = int(round(float(reg) * N))
@@ -179,22 +174,24 @@ def fit_gosdt_get_objective(X, y, reg, depth_budget=5, verbose=False):
     n_leaves = count_leaves(raw_model)
     return model_loss + reg * n_leaves
 
-def run_resplit(X, y, reg, mult, depth):
+def run_resplit(X, y, reg, mult, depth, method="resplitt"):
     # RESPLIT inherits TREEFARMS' depth convention (root depth = 1)
     depth_tf = depth + 1
     config = {
         "regularization": reg,
         "rashomon_bound_multiplier": mult,
         "depth_budget": depth_tf,
-        "cart_lookahead_depth": math.ceil(depth_tf / 2),
+        "cart_lookahead_depth": math.ceil((depth_tf) / 2),
         "verbose": False
     }
-    model = RESPLIT(config, fill_tree="treefarms")
+    if method == "resplitt": fill_method="treefarms"
+    else: fill_method = "greedy"
+    model = RESPLIT(config, fill_tree=fill_method)
     t0 = time.perf_counter()
     model.fit(X, y)
     dt = time.perf_counter() - t0
     n_trees = len(model)
-    label = "RESPLIT-treefarms"
+    label = f"RESPLIT[{fill_method}]"
     return dt, n_trees, label, model
 
 def run_lickety(X, y, reg, mult, depth, best_objective=None, lookahead=1, prune_style="Z", consistent_lookahead=True, better_than_greedy=False, try_greedy_first=False, trie_cache_strategy = "compact", multiplicative_slack=0):
@@ -210,6 +207,7 @@ def run_lickety(X, y, reg, mult, depth, best_objective=None, lookahead=1, prune_
     model.fit(X, y)
     dt = time.perf_counter() - t0
     n_trees = model.count_trees()
+    print(f"Found {model.trie.count_trees()} trees but truncated to {n_trees}")
     label = f"LicketyRESPLIT[lookahead={lookahead}{prune_style}, best={'gosdt' if best_objective is not None else 'lickety'}]"
     return dt, n_trees, label, model
 
@@ -242,9 +240,9 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
 
     X, y = load_dataset(data_path)
 
-    if algo == "resplit":
+    if algo == "resplitt" or algo=="resplitg":
         target = run_resplit
-        kwargs = dict(X=X, y=y, reg=reg, mult=mult, depth=depth)
+        kwargs = dict(X=X, y=y, reg=reg, mult=mult, depth=depth, method=algo)
 
     elif algo == "lickety":
         best_obj = None
@@ -317,4 +315,39 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
     
 
 if __name__ == "__main__":
-    main("bike_binarized.csv", "lickety", reg=0.01, depth=4, mult=0.05, lookahead_k=1, prune_style="H", consistent_lookahead=False, better_than_greedy=False, use_gosdt_objective=True, try_greedy_first=False, trie_cache_strategy = "compact")
+    #main("bike_binarized.csv", "resplit", reg=0.005, depth=4, mult=0.01, lookahead_k=1, prune_style="H", consistent_lookahead=False, better_than_greedy=False, use_gosdt_objective=False, try_greedy_first=False, trie_cache_strategy = "compact")
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--data", type=str, default="spambase_binarized.csv")
+    parser.add_argument("--algo", type=str, default="lickety", choices=["resplitt", "resplitg", "lickety", "treefarms"])
+    parser.add_argument("--reg", type=float, default=0.005)
+    parser.add_argument("--depth", type=int, default=4)
+    parser.add_argument("--mult", type=float, default=0.01)
+
+    # Lickety-specific
+    parser.add_argument("--lookahead_k", type=int, default=2)
+    parser.add_argument("--prune_style", type=str, default="Z", choices=["H", "Z"])
+    parser.add_argument("--consistent_lookahead", action="store_true")
+    parser.add_argument("--better_than_greedy", action="store_true")
+    parser.add_argument("--try_greedy_first", action="store_true")
+    parser.add_argument("--trie_cache_strategy", type=str, default="compact")
+    parser.add_argument("--multiplicative_slack", type=float, default=0.0)
+    parser.add_argument("--use_gosdt_objective", action="store_true")
+
+    args = parser.parse_args()
+
+    main(
+        data_path=args.data,
+        algo=args.algo,
+        reg=args.reg,
+        depth=args.depth,
+        mult=args.mult,
+        use_gosdt_objective=args.use_gosdt_objective,
+        better_than_greedy=args.better_than_greedy,
+        lookahead_k=args.lookahead_k,
+        prune_style=args.prune_style,
+        consistent_lookahead=args.consistent_lookahead,
+        try_greedy_first=args.try_greedy_first,
+        trie_cache_strategy=args.trie_cache_strategy,
+        multiplicative_slack=args.multiplicative_slack
+    )

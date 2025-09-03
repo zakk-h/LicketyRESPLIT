@@ -34,3 +34,8 @@ Thumbs.db
 
 .vscode/
 
+*.sh
+*.err
+*.out
+/run_one_output_test/
+/slurm_jobs/
