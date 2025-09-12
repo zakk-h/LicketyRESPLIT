@@ -5,6 +5,9 @@ import numpy as np
 import gc
 import matplotlib.pyplot as plt
 from itertools import product
+from pathlib import Path
+from datetime import datetime
+import re
 
 from memory_profiler import memory_usage
 
@@ -12,6 +15,54 @@ from resplit import RESPLIT
 from licketyresplit import LicketyRESPLIT
 from treefarms import TREEFARMS
 from gosdt import GOSDTClassifier
+
+def _slug(s: str) -> str:
+    return re.sub(r'[^A-Za-z0-9._-]+', '_', s).strip('_')
+
+def dataset_name_from_path(data_path: str) -> str:
+    return Path(data_path).stem
+
+def save_one_result(
+    dataset_name: str,
+    method: str,
+    n_trees: int | None,
+    in_range_trees: int | None,
+    slackened_in_range_trees: int | None,
+    outdir: str = "bootstrap_slack_individual_results",
+) -> str:
+    out = Path(outdir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    fname = f"{_slug(dataset_name)}__{_slug(method)}__{ts}.csv"
+    fpath = out / fname
+
+    row = {
+        "dataset_name": dataset_name,
+        "method": method,
+        "n_trees": None if n_trees is None else int(n_trees),
+        "in_range_trees": None if in_range_trees is None else int(in_range_trees),
+        "slackened_in_range_trees": None if slackened_in_range_trees is None else int(slackened_in_range_trees),
+        "timestamp": ts,
+    }
+    pd.DataFrame([row]).to_csv(fpath, index=False)
+    return str(fpath)
+
+def aggregate_results(outdir: str = "bootstrap_slack_individual_results",
+                      save_to: str | None = None) -> pd.DataFrame:
+    out = Path(outdir)
+    files = sorted(out.glob("*.csv"))
+    if not files:
+        return pd.DataFrame(columns=[
+            "dataset_name","method","n_trees",
+            "in_range_trees","slackened_in_range_trees","timestamp"
+        ])
+
+    df = pd.concat((pd.read_csv(f) for f in files), ignore_index=True)
+    if save_to:
+        Path(save_to).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(save_to, index=False)
+    return df
 
 def structurally_equal(a, b):
     if type(a) != type(b):
@@ -295,6 +346,38 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
         print(f"best_objective      : {model.best}")
         print(f"rashomon_obj_bound  : {model.obj_bound}")
 
+    in_range = None
+    slackened_in_range = None
+    if True and algo in ("resplitt", "resplitg", "lickety"):
+        if algo == "lickety":
+            gosdt_obj = fit_gosdt_get_objective(X_bool, y_uint8, reg=reg, depth_budget=depth)
+            N = len(y_uint8)
+            scaled_gosdt = int(round(gosdt_obj * N))
+            print("scaled gosdt ", scaled_gosdt)
+            if scaled_gosdt == int(model.trie.min_objective):
+                total_in_trie = model.trie.count_trees()
+                in_range = total_in_trie
+                slackened_in_range = total_in_trie
+            else:
+                in_range = model.count_trees(min_obj=None, max_obj=int(round((1+mult)*gosdt_obj*N)))
+                slackened_in_range = model.count_trees(min_obj=None, max_obj=int(round((1+mult)*gosdt_obj*N+0.01*N)))
+
+        else: 
+            gosdt_obj = fit_gosdt_get_objective(X, y, reg=reg, depth_budget=depth)
+            low = gosdt_obj
+            high = (1+mult)*gosdt_obj
+            # in_range = model.count_objectives_between(X,y, low=min(0.01, low), high=high, reg=reg, return_list = False)
+            # slackened_in_range = model.count_objectives_between(X,y, low=min(0.01, low), high=high+0.01, reg=reg, return_list = False)
+            gosdt_obj = fit_gosdt_get_objective(X, y, reg=reg, depth_budget=depth)
+            low = gosdt_obj
+            high = (1 + mult) * gosdt_obj
+            _, objectives = model.count_objectives_between(X, y, low=min(0.01, low), high=high + 0.01, reg=reg, return_list=True)
+            in_range = sum(min(0.01, low) <= obj <= high for obj in objectives)
+            slackened_in_range = sum(min(0.01, low) <= obj <= high + 0.01 for obj in objectives)
+
+        print(f"algorithm_in_range    : {in_range}  (objective in [low, high])")
+        print(f"slackened_algorithm_in_range    : {slackened_in_range}  (objective in [low, high+0.01])")
+
 
     print("\n=== RESULT ===")
     print(f"algo               : {label}")
@@ -310,6 +393,15 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
     print(f"delta_rss_mb        : {delta_mb:.1f}")
     print(f"num_trees          : {n_trees}")
 
+    dataset_name = dataset_name_from_path(data_path)
+    save_one_result(
+        dataset_name=dataset_name,
+        method=algo,
+        n_trees=n_trees,
+        in_range_trees=in_range,
+        slackened_in_range_trees=slackened_in_range,
+    )
+
     return duration_s, peak_mb, delta_mb, n_trees
 
     
@@ -318,15 +410,15 @@ if __name__ == "__main__":
     #main("bike_binarized.csv", "resplit", reg=0.005, depth=4, mult=0.01, lookahead_k=1, prune_style="H", consistent_lookahead=False, better_than_greedy=False, use_gosdt_objective=False, try_greedy_first=False, trie_cache_strategy = "compact")
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--data", type=str, default="spambase_binarized.csv")
-    parser.add_argument("--algo", type=str, default="lickety", choices=["resplitt", "resplitg", "lickety", "treefarms"])
-    parser.add_argument("--reg", type=float, default=0.005)
+    parser.add_argument("--data", type=str, default="bootstraps/covertype_binarized_small_boot8.csv")
+    parser.add_argument("--algo", type=str, default="resplitt", choices=["resplitt", "resplitg", "lickety", "treefarms"])
+    parser.add_argument("--reg", type=float, default=0.01)
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--mult", type=float, default=0.01)
 
     # Lickety-specific
-    parser.add_argument("--lookahead_k", type=int, default=2)
-    parser.add_argument("--prune_style", type=str, default="Z", choices=["H", "Z"])
+    parser.add_argument("--lookahead_k", type=int, default=1)
+    parser.add_argument("--prune_style", type=str, default="H", choices=["H", "Z"])
     parser.add_argument("--consistent_lookahead", action="store_true")
     parser.add_argument("--better_than_greedy", action="store_true")
     parser.add_argument("--try_greedy_first", action="store_true")

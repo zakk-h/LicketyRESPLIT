@@ -44,7 +44,7 @@ class LicketyRESPLIT:
             If True, uses ThresholdGuessBinarizer for binarization.
             If False, requires binary input data.
     '''
-    def __init__(self, config, binarize=False, lookahead=1, multipass=True, consistent_lookahead = False, prune_style = "H", gbdt_n_est=50, gbdt_max_depth=1, optimal=False, pruning=True, better_than_greedy=False, try_greedy_first=False, trie_cache_strategy="compact", multiplicative_slack=0):
+    def __init__(self, config, binarize=False, lookahead=1, multipass=True, consistent_lookahead = False, prune_style = "H", gbdt_n_est=50, gbdt_max_depth=1, optimal=False, pruning=True, better_than_greedy=False, try_greedy_first=False, trie_cache_strategy="compact", multiplicative_slack=0, cache_greedy=True, cache_lickety=True):
         self.config = config
         self.domultipass = multipass
         self.lookahead = lookahead
@@ -61,6 +61,9 @@ class LicketyRESPLIT:
         self.greedy_cache = dict()
         self.trie_cache = dict()
         self.lickety_cache = dict()
+        self.cache_greedy = cache_greedy
+        self.cache_lickety = cache_lickety
+        self.trie_cache_strategy = trie_cache_strategy
         self._pack_cache = {}
         self.binarize = binarize
         if self.binarize: # binarize using threshold guessing
@@ -71,7 +74,6 @@ class LicketyRESPLIT:
         self.optimal = optimal
         self.pruning = pruning
         self.try_greedy_first = try_greedy_first
-        self.trie_cache_strategy = trie_cache_strategy
         self.multiplicative_slack = multiplicative_slack
     #@profile
     def fit(self, X, y):
@@ -115,28 +117,28 @@ class LicketyRESPLIT:
                 else:
                     best = int(round(best * self._n))
             # final Rashomon bound
-            #obj_bound = round(best * (1+mult)) # the objectives are round so we will also round here
-            obj_bound = math.ceil(best * (1 + mult)) # pretty arbituary, round may be more technically correct but expanding doesn't hurt - in practice things have just barely been outside that treefarms finds
+            obj_bound = round(best * (1+mult)) # the objectives are round so we will also round here
+            #obj_bound = math.ceil(best * (1 + mult)) # pretty arbituary, round may be more technically correct but expanding doesn't hurt - in practice things have just barely been outside that treefarms finds
 
         self.best = int(best) if best is not None else None
         self.obj_bound = int(obj_bound)
         
-        self.trie = self.construct_trie(root_bitvector, depth, int(math.ceil(obj_bound * (1 + self.multiplicative_slack))))
+        self.trie = self.construct_trie(root_bitvector, depth, int(round(obj_bound * (1 + self.multiplicative_slack))))
         t1 = time.time()
         print(f"[LicketyRESPLIT] Finished in {t1 - t0:.3f} seconds with {self.trie.count_trees()} trees (truncated to {self.count_trees()})")
         return self
     
     def count_trees(self, max_obj=None, min_obj=None, inclusive=True):
         # works even with multiplicative_slack
-        if max_obj is None: max_obj = int(math.ceil(self.trie.min_objective*(1+self.config['rashomon_bound_multiplier']))) # more authentic because best could have improved
+        if max_obj is None: max_obj = int(round(self.trie.min_objective*(1+self.config['rashomon_bound_multiplier']))) # more authentic because best could have improved
         return self.trie.count_trees_within_objective(max_obj, min_obj=min_obj, inclusive=inclusive)
 
     def list_trees(self, max_obj=None, min_obj=None, inclusive=True):
-        if max_obj is None: max_obj = int(math.ceil(self.trie.min_objective*(1+self.config['rashomon_bound_multiplier'])))
+        if max_obj is None: max_obj = int(round(self.trie.min_objective*(1+self.config['rashomon_bound_multiplier'])))
         return self.trie.list_trees_within_objective(max_obj=max_obj, min_obj=min_obj, inclusive=inclusive)
 
     def iter_trees(self, max_obj=None, min_obj=None, inclusive=True):
-        if max_obj is None: max_obj = int(math.ceil(self.trie.min_objective*(1+self.config['rashomon_bound_multiplier'])))
+        if max_obj is None: max_obj = int(round(self.trie.min_objective*(1+self.config['rashomon_bound_multiplier'])))
         return self.trie.iter_trees_within_objective(max_obj=max_obj, min_obj=min_obj, inclusive=inclusive)
 
     def iter_predictions(self, X=None, max_obj=None, min_obj=None, inclusive=True):
@@ -160,53 +162,68 @@ class LicketyRESPLIT:
         return np.unique(preds, axis=0).shape[0]
 
     #@profile
-    def _key_bytes(self, bv: np.ndarray):
+    def _key_bytes(self, bv: np.ndarray): # for memory-efficiency - if ive seen this exact byte string b before, give me the one I stored earlier.
         bv = np.ascontiguousarray(bv, dtype=np.bool_)
         b = np.packbits(bv, bitorder="little").tobytes()
         return self._pack_cache.setdefault(b, b)
 
+    def _greedy_cache_get(self, key):
+        return self.greedy_cache.get(key) if self.cache_greedy else None
+
+    def _greedy_cache_set(self, key, val):
+        if self.cache_greedy:
+            self.greedy_cache[key] = val
+
+    def _lickety_cache_get(self, key):
+        return self.lickety_cache.get(key) if self.cache_lickety else None
+
+    def _lickety_cache_set(self, key, val):
+        if self.cache_lickety:
+            self.lickety_cache[key] = val
+
     #@profile
     def construct_trie(self, bitvector, depth, budget):
-        bv_key  = self._key_bytes(bitvector)
-        if self.trie_cache_strategy != "compact":
-            key = (bv_key, depth, budget)
-            if key in self.trie_cache:
-                return self.trie_cache[key]
-        else:
-            entry = self.trie_cache.get(bv_key)
-            if entry is not None:
-                (d_max, b_at_d, trieD), (d_at_b, b_max, trieB) = entry
+        if self.trie_cache_strategy:
+            bv_key  = self._key_bytes(bitvector)
+            if self.trie_cache_strategy != "compact":
+                key = (bv_key, depth, budget)
+                if key in self.trie_cache:
+                    return self.trie_cache[key]
+            else:
+                entry = self.trie_cache.get(bv_key)
+                if entry is not None:
+                    (d_max, b_at_d, trieD), (d_at_b, b_max, trieB) = entry
 
-                # prefer whichever qualifies as a superset; either is fine
-                if d_max >= depth and b_at_d >= budget:
-                    return trieD.truncated_copy(max_depth=depth, budget=budget)
-                if d_at_b >= depth and b_max >= budget:
-                    return trieB.truncated_copy(max_depth=depth, budget=budget)
-        # if you have a greater budget or a smaller depth than an existing solution to the subproblem, you could also return that (it is subset)
-        if self.trie_cache_strategy == "superset":
-            max_depth_cfg = int(self.config.get('depth_budget', depth))
-            max_budget_101 = int(math.ceil(budget * 1.01))
-            # same depth, bigger budget
-            if max_budget_101 > budget:
-                for b2 in range(budget + 1, max_budget_101 + 1):
-                    k2 = (bv_key, depth, b2)
-                    if k2 in self.trie_cache:
-                        return self.trie_cache[k2].truncated_copy(max_depth=depth, budget=budget)
-
-            # bigger depth, same budget
-            if max_depth_cfg > depth:
-                for d2 in range(depth + 1, max_depth_cfg + 1):
-                    k2 = (bv_key, d2, budget)
-                    if k2 in self.trie_cache:
-                        return self.trie_cache[k2].truncated_copy(max_depth=depth, budget=budget)
-
-            # bigger depth AND bigger budget band
-            if max_depth_cfg > depth and max_budget_101 > budget:
-                for d2 in range(depth + 1, max_depth_cfg + 1):
+                    # prefer whichever qualifies as a superset; either is fine
+                    if d_max >= depth and b_at_d >= budget:
+                        return trieD.truncated_copy(max_depth=depth, budget=budget)
+                    if d_at_b >= depth and b_max >= budget:
+                        return trieB.truncated_copy(max_depth=depth, budget=budget)
+            # if you have a greater budget or a smaller depth than an existing solution to the subproblem, you could also return that (it is subset)
+            if self.trie_cache_strategy == "superset":
+                max_depth_cfg = int(self.config.get('depth_budget', depth))
+                max_budget_101 = int(math.ceil(budget * 1.01))
+                # same depth, bigger budget
+                if max_budget_101 > budget:
                     for b2 in range(budget + 1, max_budget_101 + 1):
-                        k2 = (bv_key, d2, b2)
+                        k2 = (bv_key, depth, b2)
                         if k2 in self.trie_cache:
                             return self.trie_cache[k2].truncated_copy(max_depth=depth, budget=budget)
+
+                # bigger depth, same budget
+                if max_depth_cfg > depth:
+                    for d2 in range(depth + 1, max_depth_cfg + 1):
+                        k2 = (bv_key, d2, budget)
+                        if k2 in self.trie_cache:
+                            return self.trie_cache[k2].truncated_copy(max_depth=depth, budget=budget)
+
+                # bigger depth AND bigger budget band
+                if max_depth_cfg > depth and max_budget_101 > budget:
+                    for d2 in range(depth + 1, max_depth_cfg + 1):
+                        for b2 in range(budget + 1, max_budget_101 + 1):
+                            k2 = (bv_key, d2, b2)
+                            if k2 in self.trie_cache:
+                                return self.trie_cache[k2].truncated_copy(max_depth=depth, budget=budget)
 
         trie = TreeTrieNode(budget=budget)
         N  = self._n
@@ -273,24 +290,25 @@ class LicketyRESPLIT:
             left_trie, right_trie = result
             trie.add_split(feat, left_trie, right_trie)
 
-        if self.trie_cache_strategy != "compact": self.trie_cache[key] = trie
-        else: 
-            old = self.trie_cache.get(bv_key)
-            if old is None:
-                # initialize both slots with this trie; ok if identical
-                self.trie_cache[bv_key] = ((depth, budget, trie), (depth, budget, trie))
-            else:
-                (d_max, b_at_d, trieD), (d_at_b, b_max, trieB) = old
+        if self.trie_cache_strategy is not None:
+            if self.trie_cache_strategy != "compact": self.trie_cache[key] = trie
+            else: 
+                old = self.trie_cache.get(bv_key)
+                if old is None:
+                    # initialize both slots with this trie; ok if identical
+                    self.trie_cache[bv_key] = ((depth, budget, trie), (depth, budget, trie))
+                else:
+                    (d_max, b_at_d, trieD), (d_at_b, b_max, trieB) = old
 
-                # update max-depth slot
-                if depth > d_max:
-                    d_max, b_at_d, trieD = depth, budget, trie
+                    # update max-depth slot
+                    if depth > d_max:
+                        d_max, b_at_d, trieD = depth, budget, trie
 
-                # update max-budget slot
-                if budget > b_max:
-                    d_at_b, b_max, trieB = depth, budget, trie
+                    # update max-budget slot
+                    if budget > b_max:
+                        d_at_b, b_max, trieB = depth, budget, trie
 
-                self.trie_cache[bv_key] = ((d_max, b_at_d, trieD), (d_at_b, b_max, trieB))
+                    self.trie_cache[bv_key] = ((d_max, b_at_d, trieD), (d_at_b, b_max, trieB))
         return trie
 
     #@profile
@@ -379,8 +397,9 @@ class LicketyRESPLIT:
         N = self._n
         reg = self.lamN # scaled integer
         key = (self._key_bytes(bitvector), depth_budget)
-        if key in self.greedy_cache:
-            return self.greedy_cache[key]
+        cached = self._greedy_cache_get(key)
+        if cached is not None:
+            return cached
         y_train = self.y_full[bitvector]
         n_sub = y_train.size # needed for a better way to check if the mean of the subproblem is above 0.5 or not
 
@@ -388,7 +407,7 @@ class LicketyRESPLIT:
 
         if n_sub == 0:
             # empty node contributes nothing
-            self.greedy_cache[key] = 0
+            #self._greedy_cache_set(key, 0) # not worth caching
             return 0
             
         # take majority label
@@ -397,17 +416,17 @@ class LicketyRESPLIT:
         loss = reg + errors # integer
 
         if depth_budget <= 0: # I HAVE ADJUSTED THIS TO TAKE DEPTH 0 BEING ROOT CONVENTION
-            self.greedy_cache[key] = loss
+            self._greedy_cache_set(key, loss)
             return loss
 
         if loss <= 2 * reg: # errors==0 is a special case of this
-            self.greedy_cache[key] = loss
+            self._greedy_cache_set(key, loss)
             return loss
 
 
         best_feature = self.find_best_feature_to_split_on(bitvector)
         if best_feature is None:
-            self.greedy_cache[key] = loss
+            self._greedy_cache_set(key, loss)
             return loss 
         bf = self.X_bool[:, best_feature]
         # left_bitvector  = bitvector & bf
@@ -422,7 +441,7 @@ class LicketyRESPLIT:
             if left_loss + right_loss < loss: # only split if it improves the loss
                 loss = left_loss + right_loss
             
-        self.greedy_cache[key] = loss
+        self._greedy_cache_set(key, loss)
         return loss
 
     #@profile
@@ -439,12 +458,13 @@ class LicketyRESPLIT:
             else:
                 key = (self._key_bytes(bitvector), depth_budget)
                 
-        if key in self.lickety_cache:
-            return self.lickety_cache[key]
+        cached = self._lickety_cache_get(key)
+        if cached is not None:
+            return cached
             
         if depth_budget <= 0: # adopt leaf logic
             a = self.train_greedy(bitvector, 0)
-            self.lickety_cache[key] = a
+            #self._lickety_cache_set(key, a) # just recompute, not expensive, especially because greedy will be cached
             return a
 
         y_subset = self.y_full[bitvector]
@@ -455,7 +475,7 @@ class LicketyRESPLIT:
         #leaf_node = Leaf(prediction=pred, loss=leaf_loss)
 
         if leaf_loss <= 2 * self.lamN:
-            self.lickety_cache[key] = leaf_loss
+            self._lickety_cache_set(key, leaf_loss)
             return leaf_loss
 
         
@@ -487,7 +507,7 @@ class LicketyRESPLIT:
 
         if best_feat is None or best_loss >= leaf_loss:
             # no useful split (i.e the X are constant for every split, so every split was meaningless) OR split doesn't beat the leaf 
-            self.lickety_cache[key] = leaf_loss
+            self._lickety_cache_set(key, leaf_loss)
             return leaf_loss
 
         if self.consistent_lookahead and self.lookahead_map is not None:
@@ -505,7 +525,7 @@ class LicketyRESPLIT:
         #node = Node(feature=best_feat, left_child=left_node, right_child=right_node)
         #node.loss = lickety_loss
 
-        self.lickety_cache[key] = lickety_loss
+        self._lickety_cache_set(key, lickety_loss)
         return lickety_loss
 
     #@profile

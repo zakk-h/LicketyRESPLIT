@@ -7,14 +7,29 @@ import time
 import warnings
 import pandas as pd
 from treefarms_rid_utils import construct_tree_rset
-from lickety_vi_utils import get_model_reliances
+from resplit_vi_utils import get_model_reliances
 from sklearn.utils import resample
-from licketyresplit import LicketyRESPLIT
+#from licketyresplit import LicketyRESPLIT
+from resplit import RESPLIT
 
 #from gosdt.model.threshold_guess import compute_thresholds
 from split import ThresholdGuessBinarizer
 from pathos.multiprocessing import ProcessingPool as Pool
 from tqdm import tqdm
+
+class RESPLITPredictionAdapter:
+    def __init__(self, fitted_resplit):
+        self.model = fitted_resplit
+
+    def get_all_predictions(self, X_bool, stack=True):
+        n_trees = len(self.model)
+        n_samples = X_bool.shape[0]
+        out = np.empty((n_trees, n_samples), dtype=np.uint8)
+        iterator = range(n_trees)
+        iterator = tqdm(iterator, total=n_trees, desc="RESPLIT predict", leave=False)
+        for t in iterator:
+            out[t, :] = self.model.predict(X_bool, t)
+        return out
 
 def compute_thresholds(X_all, y, n_est=40, max_depth=1):
     """
@@ -128,7 +143,8 @@ class RashomonImportanceDistribution:
         self.rashomon_output_dir = rashomon_output_dir
         self.verbose = verbose
         self.max_par_for_gosdt = max_par_for_gosdt
-        self.lickety_lookahead = lickety_lookahead
+        #self.lickety_lookahead = lickety_lookahead
+        self.resplit_cart_lookahead = int(math.ceil(self.db / 2))
 
         try:
             self.num_cpus = os.cpu_count()
@@ -158,7 +174,8 @@ class RashomonImportanceDistribution:
         self._compute_and_aggregate_vis()
 
         self.vi_dataframe = self._read_vis_to_construct_rid(
-            file_paths=[os.path.join(self.cache_dir, f'lickety_{self.vi_metric}s_bootstrap_{i}_eps_{eps}_db_{db}_reg_{lam}_lh_{self.lickety_lookahead}.pickle') for i in range(n_resamples)],
+            file_paths=[os.path.join(self.cache_dir, f'resplit_{self.vi_metric}s_bootstrap_{i}_eps_{eps}_db_{db}_reg_{lam}.pickle')
+                        for i in range(n_resamples)],
             n_vars=self.n_vars
         )
         self.rid_with_counts = self._get_df_with_counts()
@@ -180,15 +197,10 @@ class RashomonImportanceDistribution:
             resampled_df.to_csv(os.path.join(self.cache_dir, f'tmp_bootstrap_{bootstrap_ind}.csv'), index=False)
 
     def _construct_rashomon_sets(self, bootstrap_ind):
-        """
-        Constructs and stores the Rashomon set for the given bootstrap index,
-        using LicketyRESPLIT instead of construct_tree_rset. Saves a pickle
-        (not JSON) containing the trie and minimal metadata.
-        """
         rset_path = os.path.join(
             self.cache_dir,
             self.rashomon_output_dir,
-            f'lickety_trie_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}_lh_{self.lickety_lookahead}.pkl'
+            f'resplit_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}.pkl'
         )
 
         if os.path.isfile(rset_path):
@@ -197,33 +209,32 @@ class RashomonImportanceDistribution:
             return
 
         if self.verbose:
-            print(f"[RID] Generating Rashomon set with LicketyRESPLIT for bootstrap {bootstrap_ind}")
+            print(f"[RID] Generating Rashomon set with RESPLIT for bootstrap {bootstrap_ind}")
 
         df = pd.read_csv(os.path.join(self.cache_dir, f'tmp_bootstrap_{bootstrap_ind}.csv'))
         X = df.iloc[:, :-1]
-        y = df.iloc[:, -1]
+        y = df.iloc[:, -1].astype(np.uint8)
+        if y.name is None:
+            y.name = "label"
 
         config = {
             "regularization": float(self.lam),
-            "depth_budget":   int(self.db-1), # depth-0 is root for licketyresplit
+            "depth_budget":   int(self.db),
             "rashomon_bound_multiplier": float(self.eps),
+            "cart_lookahead_depth": int(self.resplit_cart_lookahead),
+            "fill_tree": "treefarms",
+            "verbose": False,
         }
-        model = LicketyRESPLIT(
-            config=config,
-            binarize=False, # we’re already binarized upstream
-            lookahead=self.lickety_lookahead,
-            multipass=True
-        )
-        model.fit(X, y)  # builds model.trie (TreeTrieNode)
 
-        trie_trunc = model.trie.truncated_copy(max_depth=int(self.db - 1), budget=int(round(model.trie.min_objective * (1.0 + self.eps))))
+        model = RESPLIT(config=config, load_path=False, fill_tree="treefarms", save_trie_tmp=False)
+        model.fit(X, y)
 
-        # some of this stuff may not be needed
+        adapter = RESPLITPredictionAdapter(model)
+
         artifact = {
-            "trie": trie_trunc,
+            "model": adapter,               # the only thing RID needs later
             "feature_names": list(X.columns),
             "config": config,
-            "lamN": getattr(model, "lamN", None),
             "n": len(y),
         }
 
@@ -231,7 +242,8 @@ class RashomonImportanceDistribution:
             pickle.dump(artifact, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         if self.verbose:
-            print(f"[RID] Saved LicketyRESPLIT trie to {rset_path}")
+            print(f"[RID] Saved RESPLIT artifact to {rset_path}")
+
 
 
     def _binarize_data_guesses(self, df_unbinned):
@@ -316,7 +328,7 @@ class RashomonImportanceDistribution:
                     else:
                         target_div_model_reliances[var][mr] = cur_model_reliance[var][mr]
 
-            with open(os.path.join(self.cache_dir, f'lickety_div_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}_lh_{self.lickety_lookahead}.pickle'), 'wb') as f:
+            with open(os.path.join(self.cache_dir, f'resplit_div_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}.pickle'), 'wb') as f:
                 pickle.dump(target_div_model_reliances, f, protocol=pickle.HIGHEST_PROTOCOL)
 
             cur_model_reliance = val[1]
@@ -329,7 +341,7 @@ class RashomonImportanceDistribution:
                     else:
                         target_sub_model_reliances[var][mr] = cur_model_reliance[var][mr]
 
-            with open(os.path.join(self.cache_dir, f'lickety_sub_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}_lh_{self.lickety_lookahead}.pickle'), 'wb') as f:
+            with open(os.path.join(self.cache_dir, f'resplit_sub_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}.pickle'), 'wb') as f:
                 pickle.dump(target_sub_model_reliances, f, protocol=pickle.HIGHEST_PROTOCOL)
             
         if self.verbose:
@@ -353,29 +365,35 @@ class RashomonImportanceDistribution:
             bootstrap_ind : int
                 The index of the current bootstrap
         '''
-        if os.path.isfile(os.path.join(self.cache_dir, f'lickety_div_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}_lh_{self.lickety_lookahead}.pickle'))\
-            and os.path.isfile(os.path.join(self.cache_dir, f'lickety_sub_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}_lh_{self.lickety_lookahead}.pickle')):
+        if os.path.isfile(os.path.join(self.cache_dir, f'resplit_div_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}.pickle'))\
+            and os.path.isfile(os.path.join(self.cache_dir, f'resplit_sub_mrs_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}.pickle')):
             return None
 
         div_model_reliances = [{'means':[]} for i in range(self.n_vars)]
         sub_model_reliances = [{'means':[]} for i in range(self.n_vars)]
 
         resampled_df = pd.read_csv(os.path.join(self.cache_dir, f'tmp_bootstrap_{bootstrap_ind}.csv'))
-        trie_path = os.path.join(self.cache_dir, 
-                        self.rashomon_output_dir, 
-                        f'lickety_trie_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}_lh_{self.lickety_lookahead}.pkl')
+        resplit_path = os.path.join(
+            self.cache_dir,
+            self.rashomon_output_dir,
+            f'resplit_bootstrap_{bootstrap_ind}_eps_{self.eps}_db_{self.db}_reg_{self.lam}.pkl'
+        )
                         
-        with open(trie_path, 'rb') as f:
+        with open(resplit_path, 'rb') as f:
             artifact = pickle.load(f)
-            running_trie = artifact['trie'] 
+            running_model = artifact['model']
 
             if self.verbose:
                 cur_iterator = tqdm(self.binning_map)
             else:
                 cur_iterator = self.binning_map
             for var in cur_iterator:
-                tmp_div_model_reliances, tmp_sub_model_reliances, num_models = get_model_reliances(running_trie, resampled_df, 
-                    var_of_interest=self.binning_map[var])
+                print(f"Getting variable importance for var {var} out of {self.n_vars}")
+                tmp_div_model_reliances, tmp_sub_model_reliances, num_models = get_model_reliances(
+                    running_model,
+                    resampled_df,
+                    var_of_interest=self.binning_map[var]
+                )
 
                 div_model_reliances[var] = tmp_div_model_reliances
                 sub_model_reliances[var] = tmp_sub_model_reliances
