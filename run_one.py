@@ -243,7 +243,7 @@ def run_resplit(X, y, reg, mult, depth):
     label = "RESPLIT-treefarms"
     return dt, n_trees, label, model
 
-def run_lickety(X, y, reg, mult, depth, best_objective=None, lookahead=1, prune_style="Z", consistent_lookahead=True, better_than_greedy=False, try_greedy_first=False, trie_cache_strategy = "compact", multiplicative_slack=0):
+def run_lickety(X, y, reg, mult, depth, best_objective=None, lookahead=1, prune_style="Z", consistent_lookahead=True, better_than_greedy=False, try_greedy_first=False, trie_cache_strategy = "compact", multiplicative_slack=0, cache_greedy=True, cache_lickety=True, cache_packbits=True, cache_key_mode="bitvector"):
     config = {
         "regularization": reg,
         "rashomon_bound_multiplier": mult,
@@ -251,7 +251,7 @@ def run_lickety(X, y, reg, mult, depth, best_objective=None, lookahead=1, prune_
     }
     if best_objective is not None:
         config["best_objective"] = best_objective
-    model = LicketyRESPLIT(config, multipass=True, lookahead=int(lookahead), optimal=False, pruning=True, prune_style=prune_style, consistent_lookahead=consistent_lookahead, better_than_greedy=better_than_greedy, try_greedy_first=False, multiplicative_slack=multiplicative_slack, trie_cache_strategy = None, cache_greedy=False, cache_lickety=False, cache_packbits=False, cache_key_mode="bitvector")
+    model = LicketyRESPLIT(config, multipass=True, lookahead=int(lookahead), optimal=False, pruning=True, prune_style=prune_style, consistent_lookahead=consistent_lookahead, better_than_greedy=better_than_greedy, try_greedy_first=try_greedy_first, multiplicative_slack=multiplicative_slack, trie_cache_strategy = trie_cache_strategy, cache_greedy=cache_greedy, cache_lickety=cache_lickety, cache_packbits=cache_packbits, cache_key_mode=cache_key_mode)
     t0 = time.perf_counter()
     model.fit(X, y)
     dt = time.perf_counter() - t0
@@ -283,7 +283,7 @@ def run_treefarms(X, y, reg, mult, depth):
     return dt, n_trees, label, model
 
 # -------------- main --------------
-def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_objective=False, better_than_greedy = False, lookahead_k = 1, prune_style = "H", consistent_lookahead=False, try_greedy_first=False, trie_cache_strategy = "compact", multiplicative_slack=0.00):
+def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_objective=False, better_than_greedy = False, lookahead_k = 1, prune_style = "H", consistent_lookahead=False, try_greedy_first=False, trie_cache_strategy = "compact", multiplicative_slack=0.00, cache_greedy=True, cache_lickety=True, cache_packbits=True, cache_key_mode="bitvector"):
 
     # =======================================
 
@@ -308,7 +308,7 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
         del X, y, X_arr, y_arr
         gc.collect()
         target = run_lickety
-        kwargs = dict(X=X_bool, y=y_uint8, reg=reg, mult=mult, depth=depth, best_objective=best_obj, lookahead=lookahead_k, prune_style=prune_style, consistent_lookahead=consistent_lookahead, better_than_greedy=better_than_greedy, try_greedy_first=try_greedy_first, trie_cache_strategy = trie_cache_strategy, multiplicative_slack=multiplicative_slack)
+        kwargs = dict(X=X_bool, y=y_uint8, reg=reg, mult=mult, depth=depth, best_objective=best_obj, lookahead=lookahead_k, prune_style=prune_style, consistent_lookahead=consistent_lookahead, better_than_greedy=better_than_greedy, try_greedy_first=try_greedy_first, trie_cache_strategy = trie_cache_strategy, multiplicative_slack=multiplicative_slack, cache_greedy=cache_greedy, cache_lickety=cache_lickety, cache_packbits=cache_packbits, cache_key_mode=cache_key_mode)
 
     elif algo == "treefarms":
         target = run_treefarms
@@ -368,4 +368,4 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
     
 
 if __name__ == "__main__":
-    main("magic_binarized.csv", "lickety", reg=0.01, depth=5, mult=0.01, lookahead_k=1, prune_style="H", consistent_lookahead=False, better_than_greedy=False, use_gosdt_objective=False, try_greedy_first=False, trie_cache_strategy = None)
+    main("magic_binarized.csv", "lickety", reg=0.01, depth=5, mult=0.01, lookahead_k=1, prune_style="H", consistent_lookahead=False, better_than_greedy=False, use_gosdt_objective=False, try_greedy_first=False, trie_cache_strategy = None, cache_greedy=False, cache_lickety=False, cache_packbits=False, cache_key_mode="bitvector")
