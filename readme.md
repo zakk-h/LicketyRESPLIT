@@ -99,7 +99,7 @@ Any reasonable input will suffice and be handled internally, however, we note de
 - **prune_style="Z"**: cycle k, k-1, ..., 1, k, ... as the lookahead for choosing each split. You can also enable `consistent_lookahead=True` to map depth->k deterministically (helps cache hits)
 - **try_greedy_first=True** allows cheap pruning: if greedy(left)+greedy(right) already is within budget, skip expensive oracles and explore
 
-## What the Trie Stores (and Why It's Useful)
+## What the Trie Stores
 
 ```python
 TreeTrieNode(budget):
@@ -128,7 +128,7 @@ LicketyRESPLIT convenience wrappers call into the trie with the correct Rashomon
 
 - Trees are ordered by increasing objective, breaking ties with a deterministic internal method.
 
-## Interfacing Notes / "Gotchas"
+## Interfacing Notes
 
 - Depth convention in this module is "root depth = 0". 
 - Objective values are integers; when you supply best_objective in `config`, you can pass count-form (int) or normalized (float in [0,1]) — it's normalized internally to counts.
@@ -138,3 +138,8 @@ LicketyRESPLIT convenience wrappers call into the trie with the correct Rashomon
 ## Troubleshooting & Performance
 
 - If memory spikes: consider `trie_cache_strategy=None` and `greedy_cache=lickety_cache=cache_packbits=False` to storing tons of subproblem solutions (though this will greatly increase runtime). 
+
+
+## Testing
+
+See `run_one.py` to run and compare Rashomon set algorithms (TreeFARMS, RESPLIT, LicketyRESPLIT) with a binarized dataset in the repository (such as `bike_binarized.csv`)
