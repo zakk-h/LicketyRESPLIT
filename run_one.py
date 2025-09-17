@@ -5,9 +5,6 @@ import numpy as np
 import gc
 import matplotlib.pyplot as plt
 from itertools import product
-from pathlib import Path
-from datetime import datetime
-import re
 
 from memory_profiler import memory_usage
 
@@ -15,55 +12,56 @@ from resplit import RESPLIT
 from licketyresplit import LicketyRESPLIT
 from treefarms import TREEFARMS
 from gosdt import GOSDTClassifier
+from Tree import Node, Leaf
 
-def _slug(s: str) -> str:
-    return re.sub(r'[^A-Za-z0-9._-]+', '_', s).strip('_')
+def plot_tree(root, feature_names=None, figsize=(12, 6)):
+    positions = {}
+    x_counter = [0]
+    node_list = []
 
-def dataset_name_from_path(data_path: str) -> str:
-    return Path(data_path).stem
+    def _assign_coords(node, depth=0):
+        if isinstance(node, Leaf):
+            x = x_counter[0]
+            positions[node] = (x, -depth)
+            x_counter[0] += 1
+            node_list.append(node)
+        else:
+            _assign_coords(node.left_child, depth+1)
+            _assign_coords(node.right_child, depth+1)
+            x_left, _  = positions[node.left_child]
+            x_right, _ = positions[node.right_child]
+            x = 0.5 * (x_left + x_right)
+            positions[node] = (x, -depth)
+            node_list.append(node)
 
-def save_one_result(
-    dataset_name: str,
-    method: str,
-    n_trees: int | None,
-    in_range_trees: int | None,
-    slackened_in_range_trees: int | None,
-    outdir: str = "bootstrap_slack_individual_results",
-) -> str:
-    out = Path(outdir)
-    out.mkdir(parents=True, exist_ok=True)
+    _assign_coords(root)
 
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    fname = f"{_slug(dataset_name)}__{_slug(method)}__{ts}.csv"
-    fpath = out / fname
+    fig, ax = plt.subplots(figsize=figsize)
+    for node in node_list:
+        x, y = positions[node]
+        if isinstance(node, Leaf):
+            txt = f"Leaf\npred={node.prediction}\nloss={node.loss:.3f}"
+            box = dict(boxstyle="round,pad=0.3", fc="lightgreen", ec="gray")
+        else:
+            fname = f"f{node.feature}"
+            if feature_names is not None and node.feature < len(feature_names):
+                fname = feature_names[node.feature]
+            txt = f"{fname}\nloss={node.loss:.3f}"
+            box = dict(boxstyle="round,pad=0.3", fc="lightblue", ec="gray")
 
-    row = {
-        "dataset_name": dataset_name,
-        "method": method,
-        "n_trees": None if n_trees is None else int(n_trees),
-        "in_range_trees": None if in_range_trees is None else int(in_range_trees),
-        "slackened_in_range_trees": None if slackened_in_range_trees is None else int(slackened_in_range_trees),
-        "timestamp": ts,
-    }
-    pd.DataFrame([row]).to_csv(fpath, index=False)
-    return str(fpath)
+        ax.text(x, y, txt, ha="center", va="center", bbox=box)
 
-def aggregate_results(outdir: str = "bootstrap_slack_individual_results",
-                      save_to: str | None = None) -> pd.DataFrame:
-    out = Path(outdir)
-    files = sorted(out.glob("*.csv"))
-    if not files:
-        return pd.DataFrame(columns=[
-            "dataset_name","method","n_trees",
-            "in_range_trees","slackened_in_range_trees","timestamp"
-        ])
+        if isinstance(node, Node):
+            for child in (node.left_child, node.right_child):
+                x2, y2 = positions[child]
+                ax.plot([x, x2], [y, y2], "-", color="gray")
 
-    df = pd.concat((pd.read_csv(f) for f in files), ignore_index=True)
-    if save_to:
-        Path(save_to).parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(save_to, index=False)
-    return df
+    ax.set_axis_off()
+    plt.tight_layout()
+    plt.show()
 
+
+## TreeFARMS Attempts
 def structurally_equal(a, b):
     if type(a) != type(b):
         return False
@@ -85,9 +83,7 @@ def tree_structure_signature(tree):  # hashable nested tuples
                 tree_structure_signature(tree.right_child))
     raise ValueError(f"Unknown tree type: {type(tree)}")
 
-## TreeFARMS Attempts
-
-def _collect_trees_from_treefarms(model, max_try=100000):
+def _collect_trees_from_treefarms(model, max_try=10000000):
     trees, i = [], 0
     while i < max_try:
         try:
@@ -104,13 +100,17 @@ def _tree_errors(tree, X, y):
     if hasattr(tree, "score"):
         acc = float(tree.score(X, y))
         return int(round((1.0 - acc) * N)), acc
+    raise RuntimeError("Tree does not expose .score(X,y)")
 
 def _num_leaves(tree):
     if hasattr(tree, "leaves"):
         return int(getattr(tree, "leaves")())
+    raise RuntimeError("Tree does not expose leaves()/num_leaves().")
 
 def summarize_treefarms_objectives(model, X, y, reg, epsilon=0.01):
     trees = _collect_trees_from_treefarms(model)
+    if not trees:
+        raise RuntimeError("No trees retrieved from TREEFARMS (indexing/iter failed).")
 
     N = len(y)
     lamN = int(round(float(reg) * N))
@@ -225,24 +225,22 @@ def fit_gosdt_get_objective(X, y, reg, depth_budget=5, verbose=False):
     n_leaves = count_leaves(raw_model)
     return model_loss + reg * n_leaves
 
-def run_resplit(X, y, reg, mult, depth, method="resplitt"):
+def run_resplit(X, y, reg, mult, depth):
     # RESPLIT inherits TREEFARMS' depth convention (root depth = 1)
     depth_tf = depth + 1
     config = {
         "regularization": reg,
         "rashomon_bound_multiplier": mult,
         "depth_budget": depth_tf,
-        "cart_lookahead_depth": math.ceil((depth_tf) / 2),
+        "cart_lookahead_depth": math.ceil((depth_tf-1) / 2),
         "verbose": False
     }
-    if method == "resplitt": fill_method="treefarms"
-    else: fill_method = "greedy"
-    model = RESPLIT(config, fill_tree=fill_method)
+    model = RESPLIT(config, fill_tree="treefarms")
     t0 = time.perf_counter()
     model.fit(X, y)
     dt = time.perf_counter() - t0
     n_trees = len(model)
-    label = f"RESPLIT[{fill_method}]"
+    label = "RESPLIT-treefarms"
     return dt, n_trees, label, model
 
 def run_lickety(X, y, reg, mult, depth, best_objective=None, lookahead=1, prune_style="Z", consistent_lookahead=True, better_than_greedy=False, try_greedy_first=False, trie_cache_strategy = "compact", multiplicative_slack=0):
@@ -253,7 +251,7 @@ def run_lickety(X, y, reg, mult, depth, best_objective=None, lookahead=1, prune_
     }
     if best_objective is not None:
         config["best_objective"] = best_objective
-    model = LicketyRESPLIT(config, multipass=True, lookahead=int(lookahead), optimal=False, pruning=True, prune_style=prune_style, consistent_lookahead=consistent_lookahead, better_than_greedy=better_than_greedy, try_greedy_first=try_greedy_first, trie_cache_strategy = trie_cache_strategy, multiplicative_slack=multiplicative_slack)
+    model = LicketyRESPLIT(config, multipass=True, lookahead=int(lookahead), optimal=False, pruning=True, prune_style=prune_style, consistent_lookahead=consistent_lookahead, better_than_greedy=better_than_greedy, try_greedy_first=False, multiplicative_slack=multiplicative_slack, trie_cache_strategy = None, cache_greedy=False, cache_lickety=False, cache_packbits=False, cache_key_mode="bitvector")
     t0 = time.perf_counter()
     model.fit(X, y)
     dt = time.perf_counter() - t0
@@ -291,9 +289,9 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
 
     X, y = load_dataset(data_path)
 
-    if algo == "resplitt" or algo=="resplitg":
+    if algo == "resplit":
         target = run_resplit
-        kwargs = dict(X=X, y=y, reg=reg, mult=mult, depth=depth, method=algo)
+        kwargs = dict(X=X, y=y, reg=reg, mult=mult, depth=depth)
 
     elif algo == "lickety":
         best_obj = None
@@ -331,7 +329,7 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
     delta_mb = peak_mb - baseline_mb
     duration_s, n_trees, label, model = retval
 
-    if algo == "lickety":
+    if False and algo == "lickety":
         trie = model.trie
         num_unique = trie.count_unique_prediction_vectors(X=X_bool)
         print(f"Number of unique predicting trees : {num_unique}")
@@ -346,37 +344,9 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
         print(f"best_objective      : {model.best}")
         print(f"rashomon_obj_bound  : {model.obj_bound}")
 
-    in_range = None
-    slackened_in_range = None
-    if True and algo in ("resplitt", "resplitg", "lickety"):
-        if algo == "lickety":
-            gosdt_obj = fit_gosdt_get_objective(X_bool, y_uint8, reg=reg, depth_budget=depth)
-            N = len(y_uint8)
-            scaled_gosdt = int(round(gosdt_obj * N))
-            print("scaled gosdt ", scaled_gosdt)
-            if scaled_gosdt == int(model.trie.min_objective):
-                total_in_trie = model.trie.count_trees()
-                in_range = total_in_trie
-                slackened_in_range = total_in_trie
-            else:
-                in_range = model.count_trees(min_obj=None, max_obj=int(round((1+mult)*gosdt_obj*N)))
-                slackened_in_range = model.count_trees(min_obj=None, max_obj=int(round((1+mult)*gosdt_obj*N+0.01*N)))
+        #for i, tree in enumerate(model.list_trees()):
+        #    plot_tree(tree, feature_names=None, figsize=(12, 6))
 
-        else: 
-            gosdt_obj = fit_gosdt_get_objective(X, y, reg=reg, depth_budget=depth)
-            low = gosdt_obj
-            high = (1+mult)*gosdt_obj
-            # in_range = model.count_objectives_between(X,y, low=min(0.01, low), high=high, reg=reg, return_list = False)
-            # slackened_in_range = model.count_objectives_between(X,y, low=min(0.01, low), high=high+0.01, reg=reg, return_list = False)
-            gosdt_obj = fit_gosdt_get_objective(X, y, reg=reg, depth_budget=depth)
-            low = gosdt_obj
-            high = (1 + mult) * gosdt_obj
-            _, objectives = model.count_objectives_between(X, y, low=min(0.01, low), high=high + 0.01, reg=reg, return_list=True)
-            in_range = sum(min(0.01, low) <= obj <= high for obj in objectives)
-            slackened_in_range = sum(min(0.01, low) <= obj <= high + 0.01 for obj in objectives)
-
-        print(f"algorithm_in_range    : {in_range}  (objective in [low, high])")
-        print(f"slackened_algorithm_in_range    : {slackened_in_range}  (objective in [low, high+0.01])")
 
 
     print("\n=== RESULT ===")
@@ -393,53 +363,9 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
     print(f"delta_rss_mb        : {delta_mb:.1f}")
     print(f"num_trees          : {n_trees}")
 
-    dataset_name = dataset_name_from_path(data_path)
-    save_one_result(
-        dataset_name=dataset_name,
-        method=algo,
-        n_trees=n_trees,
-        in_range_trees=in_range,
-        slackened_in_range_trees=slackened_in_range,
-    )
-
     return duration_s, peak_mb, delta_mb, n_trees
 
     
 
 if __name__ == "__main__":
-    #main("bike_binarized.csv", "resplit", reg=0.005, depth=4, mult=0.01, lookahead_k=1, prune_style="H", consistent_lookahead=False, better_than_greedy=False, use_gosdt_objective=False, try_greedy_first=False, trie_cache_strategy = "compact")
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--data", type=str, default="bootstraps/covertype_binarized_small_boot8.csv")
-    parser.add_argument("--algo", type=str, default="resplitt", choices=["resplitt", "resplitg", "lickety", "treefarms"])
-    parser.add_argument("--reg", type=float, default=0.01)
-    parser.add_argument("--depth", type=int, default=4)
-    parser.add_argument("--mult", type=float, default=0.01)
-
-    # Lickety-specific
-    parser.add_argument("--lookahead_k", type=int, default=1)
-    parser.add_argument("--prune_style", type=str, default="H", choices=["H", "Z"])
-    parser.add_argument("--consistent_lookahead", action="store_true")
-    parser.add_argument("--better_than_greedy", action="store_true")
-    parser.add_argument("--try_greedy_first", action="store_true")
-    parser.add_argument("--trie_cache_strategy", type=str, default="compact")
-    parser.add_argument("--multiplicative_slack", type=float, default=0.0)
-    parser.add_argument("--use_gosdt_objective", action="store_true")
-
-    args = parser.parse_args()
-
-    main(
-        data_path=args.data,
-        algo=args.algo,
-        reg=args.reg,
-        depth=args.depth,
-        mult=args.mult,
-        use_gosdt_objective=args.use_gosdt_objective,
-        better_than_greedy=args.better_than_greedy,
-        lookahead_k=args.lookahead_k,
-        prune_style=args.prune_style,
-        consistent_lookahead=args.consistent_lookahead,
-        try_greedy_first=args.try_greedy_first,
-        trie_cache_strategy=args.trie_cache_strategy,
-        multiplicative_slack=args.multiplicative_slack
-    )
+    main("magic_binarized.csv", "lickety", reg=0.01, depth=5, mult=0.01, lookahead_k=1, prune_style="H", consistent_lookahead=False, better_than_greedy=False, use_gosdt_objective=False, try_greedy_first=False, trie_cache_strategy = None)

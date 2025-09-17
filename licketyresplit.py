@@ -44,7 +44,7 @@ class LicketyRESPLIT:
             If True, uses ThresholdGuessBinarizer for binarization.
             If False, requires binary input data.
     '''
-    def __init__(self, config, binarize=False, lookahead=1, multipass=True, consistent_lookahead = False, prune_style = "H", gbdt_n_est=50, gbdt_max_depth=1, optimal=False, pruning=True, better_than_greedy=False, try_greedy_first=False, trie_cache_strategy="compact", multiplicative_slack=0, cache_greedy=True, cache_lickety=True):
+    def __init__(self, config, binarize=False, lookahead=1, multipass=True, consistent_lookahead = False, prune_style = "H", gbdt_n_est=50, gbdt_max_depth=1, optimal=False, pruning=True, better_than_greedy=False, try_greedy_first=False, trie_cache_strategy="compact", multiplicative_slack=0, cache_greedy=True, cache_lickety=True, cache_key_mode="bitvector", cache_packbits=None):
         self.config = config
         self.domultipass = multipass
         self.lookahead = lookahead
@@ -75,21 +75,35 @@ class LicketyRESPLIT:
         self.pruning = pruning
         self.try_greedy_first = try_greedy_first
         self.multiplicative_slack = multiplicative_slack
+        self.cache_key_mode = cache_key_mode
+        if not (cache_greedy or cache_lickety or trie_cache_strategy):
+            self.cache_packbits = False
+        elif cache_packbits is not None:
+            self.cache_packbits = cache_packbits
+        else:
+            self.cache_packbits = True
+
     #@profile
     def fit(self, X, y):
         if self.binarize: # train binarizer
             X = self.enc.fit_transform(X, y)
-        Xv = X.reset_index(drop=True).values if hasattr(X, 'values') else X
-        yv = y.reset_index(drop=True).values if hasattr(y, 'values') else y
-        self.y_bool = (yv != 0)
-        self.y_full = self.y_bool.astype(np.uint8)
-        
-        if True: 
-            self.X_bool = np.empty(Xv.shape, dtype=bool, order='F')
-            np.not_equal(Xv, 0, out=self.X_bool)
+
+        if isinstance(X, np.ndarray) and X.dtype == np.bool_ and X.flags.f_contiguous:
+            self.X_bool = X  # no copy
         else:
-            self.X_bool = np.empty(Xv.shape, dtype=bool, order='C')
-            np.not_equal(Xv, 0, out=self.X_bool)
+            # single allocation; computes bool + makes Fortran layout
+            self.X_bool = np.asfortranarray(np.asarray(X) != 0, dtype=np.bool_)
+
+        # keep one copy (uint8) and view as bool without copying
+        y_arr = np.asarray(y)
+        if y_arr.dtype == np.uint8:
+            self.y_full = y_arr  # no copy
+        else:
+            # 0/1 uint8
+            self.y_full = (y_arr != 0).astype(np.uint8, copy=False)
+
+        # bool view shares memory with uint8 since itemsize==1
+        self.y_bool = self.y_full.view(np.bool_)
 
         # --- unpack config ---
         self._n = len(y)
@@ -101,14 +115,15 @@ class LicketyRESPLIT:
         best = None
         t0 = time.time()
         if self.consistent_lookahead: self.lookahead_map = self._build_lookahead_map(depth)
+        root_path = None if self.cache_key_mode == "bitvector" else frozenset()
         if self.better_than_greedy:
-            greedy_root_obj = self.train_greedy(root_bitvector, depth)
+            greedy_root_obj = self.train_greedy(root_bitvector, depth, path_key=root_path)
             obj_bound = int(greedy_root_obj)      # we'll say better or equal to than greedy
             print(f"[better_than_greedy] greedy objective at root = {greedy_root_obj} ") 
         else:
             best = self.config.get('best_objective') # compute best_objective if not provided
             if best is None:
-                best = self.lickety_split(root_bitvector, depth, max(self.lookahead,1))  # use the lickety_split method to get the best objective, caches things, and does so faster
+                best = self.lickety_split(root_bitvector, depth, max(self.lookahead,1), path_key=root_path)  # use the lickety_split method to get the best objective, caches things, and does so faster
                 print(f"Best objective on root: {best:.6f} or {(best/self._n):.6f} and {time.time() - t0:.2f} seconds using lickety")
                 # best should be an integer now
             else:
@@ -123,7 +138,7 @@ class LicketyRESPLIT:
         self.best = int(best) if best is not None else None
         self.obj_bound = int(obj_bound)
         
-        self.trie = self.construct_trie(root_bitvector, depth, int(round(obj_bound * (1 + self.multiplicative_slack))))
+        self.trie = self.construct_trie(root_bitvector, depth, int(round(obj_bound * (1 + self.multiplicative_slack))), path_key=root_path)
         t1 = time.time()
         print(f"[LicketyRESPLIT] Finished in {t1 - t0:.3f} seconds with {self.trie.count_trees()} trees (truncated to {self.count_trees()})")
         return self
@@ -162,13 +177,21 @@ class LicketyRESPLIT:
         return np.unique(preds, axis=0).shape[0]
 
     #@profile
-    def _key_bytes(self, bv: np.ndarray): # for memory-efficiency - if ive seen this exact byte string b before, give me the one I stored earlier.
+    def _key_bytes(self, bv, where): # for memory-efficiency - if ive seen this exact byte string b before, give me the one I stored earlier.
         bv = np.ascontiguousarray(bv, dtype=np.bool_)
         b = np.packbits(bv, bitorder="little").tobytes()
-        return self._pack_cache.setdefault(b, b)
+        cache_on = (
+            (where == "greedy"  and self.cache_greedy) or
+            (where == "lickety" and self.cache_lickety) or
+            (where == "trie"    and bool(self.trie_cache_strategy))
+        )
+        if self.cache_packbits and cache_on:
+            return self._pack_cache.setdefault(b, b)
+        return b
 
     def _greedy_cache_get(self, key):
         return self.greedy_cache.get(key) if self.cache_greedy else None
+
 
     def _greedy_cache_set(self, key, val):
         if self.cache_greedy:
@@ -181,49 +204,71 @@ class LicketyRESPLIT:
         if self.cache_lickety:
             self.lickety_cache[key] = val
 
+    def _encode_lit(self, feat, val_bit): # doubling the feature index and maybe adding 1 or not, so mapping (feature, on/off) to an integer
+        return (int(feat) << 1) | (int(val_bit) & 1)
+
+    def _path_add(self, path_key, feat, val_bit): # frozen-set is order invariant
+        lit = self._encode_lit(feat, val_bit)
+        if path_key is None:
+            return frozenset((lit,))
+        return frozenset((*path_key, lit))
+
+    def _cache_key(self, bitvector, path_key, where):
+        """
+        - 'bitvector': canonical packed-bytes (interned)
+        - 'literal'  : order-invariant frozenset of encoded literals
+        """
+        if self.cache_key_mode == "literal":
+            return path_key if path_key is not None else frozenset()
+        # default: bitvector
+        return self._key_bytes(bitvector, where=where)
+
     #@profile
-    def construct_trie(self, bitvector, depth, budget):
+    def construct_trie(self, bitvector, depth, budget, path_key=None):
+        base_key = self._cache_key(bitvector, path_key, where="trie")  # bytes when "bitvector", frozenset when "literal"
+
         if self.trie_cache_strategy:
-            bv_key  = self._key_bytes(bitvector)
             if self.trie_cache_strategy != "compact":
-                key = (bv_key, depth, budget)
-                if key in self.trie_cache:
-                    return self.trie_cache[key]
+                key = (base_key, depth, budget)
+                hit = self.trie_cache.get(key)
+                if hit is not None:
+                    return hit
             else:
-                entry = self.trie_cache.get(bv_key)
+                entry = self.trie_cache.get(base_key)
                 if entry is not None:
                     (d_max, b_at_d, trieD), (d_at_b, b_max, trieB) = entry
-
                     # prefer whichever qualifies as a superset; either is fine
                     if d_max >= depth and b_at_d >= budget:
                         return trieD.truncated_copy(max_depth=depth, budget=budget)
                     if d_at_b >= depth and b_max >= budget:
                         return trieB.truncated_copy(max_depth=depth, budget=budget)
-            # if you have a greater budget or a smaller depth than an existing solution to the subproblem, you could also return that (it is subset)
+
+            # optional superset probing (works with either key mode)
             if self.trie_cache_strategy == "superset":
                 max_depth_cfg = int(self.config.get('depth_budget', depth))
                 max_budget_101 = int(math.ceil(budget * 1.01))
                 # same depth, bigger budget
                 if max_budget_101 > budget:
                     for b2 in range(budget + 1, max_budget_101 + 1):
-                        k2 = (bv_key, depth, b2)
-                        if k2 in self.trie_cache:
-                            return self.trie_cache[k2].truncated_copy(max_depth=depth, budget=budget)
-
+                        k2 = (base_key, depth, b2)
+                        hit = self.trie_cache.get(k2)
+                        if hit is not None:
+                            return hit.truncated_copy(max_depth=depth, budget=budget)
                 # bigger depth, same budget
                 if max_depth_cfg > depth:
                     for d2 in range(depth + 1, max_depth_cfg + 1):
-                        k2 = (bv_key, d2, budget)
-                        if k2 in self.trie_cache:
-                            return self.trie_cache[k2].truncated_copy(max_depth=depth, budget=budget)
-
+                        k2 = (base_key, d2, budget)
+                        hit = self.trie_cache.get(k2)
+                        if hit is not None:
+                            return hit.truncated_copy(max_depth=depth, budget=budget)
                 # bigger depth AND bigger budget band
                 if max_depth_cfg > depth and max_budget_101 > budget:
                     for d2 in range(depth + 1, max_depth_cfg + 1):
                         for b2 in range(budget + 1, max_budget_101 + 1):
-                            k2 = (bv_key, d2, b2)
-                            if k2 in self.trie_cache:
-                                return self.trie_cache[k2].truncated_copy(max_depth=depth, budget=budget)
+                            k2 = (base_key, d2, b2)
+                            hit = self.trie_cache.get(k2)
+                            if hit is not None:
+                                return hit.truncated_copy(max_depth=depth, budget=budget)
 
         trie = TreeTrieNode(budget=budget)
         N  = self._n
@@ -259,110 +304,87 @@ class LicketyRESPLIT:
             right_bitvector = np.logical_and(bitvector, np.logical_not(bf))
             if not left_bitvector.any() or not right_bitvector.any():
                 continue
+            if self.cache_key_mode == "literal":
+                left_path_key  = self._path_add(path_key, feat, 1)
+                right_path_key = self._path_add(path_key, feat, 0)
+            else:
+                left_path_key = right_path_key = None
+
             # only explore things where some oracle would get within the set. maybe this means we should add some slack to the initial call and then trim after
             # it may be worth it to try greedy, and if it it within the set, you don't need to ask a more expensive oracle.
             if self.try_greedy_first:
-                loss_l  = self.train_greedy(left_bitvector,  depth - 1)
-                loss_r = self.train_greedy(right_bitvector, depth - 1)
+                loss_l  = self.train_greedy(left_bitvector,  depth - 1, path_key=left_path_key)
+                loss_r = self.train_greedy(right_bitvector, depth - 1, path_key=right_path_key)
             if (not self.try_greedy_first) or loss_l + loss_r > budget: # if greedy is bad, we need to try the other methods, but otherwise don't.
                 if self.optimal:
                     loss_l = self.objective_optimal(left_bitvector,  depth - 1)
                     loss_r = self.objective_optimal(right_bitvector, depth - 1)
                 else:
                     if self.lookahead <= 0:
-                        loss_l = self.train_greedy(left_bitvector,  depth - 1)
-                        loss_r = self.train_greedy(right_bitvector, depth - 1)
+                        loss_l = self.train_greedy(left_bitvector,  depth - 1, path_key=left_path_key)
+                        loss_r = self.train_greedy(right_bitvector, depth - 1, path_key=right_path_key)
                     else:
-                        loss_l = self.lickety_split(left_bitvector,  depth - 1, k=self.lookahead)
-                        loss_r = self.lickety_split(right_bitvector, depth - 1, k=self.lookahead)
+                        loss_l = self.lickety_split(left_bitvector,  depth - 1, k=self.lookahead, path_key=left_path_key)
+                        loss_r = self.lickety_split(right_bitvector, depth - 1, k=self.lookahead, path_key=right_path_key)
 
             # pruning should always always be on
             if self.pruning and loss_l + loss_r > budget: # if greedy isn't within budget (which starts out epsilon loose), then we can skip this feature. greedy pruning to approxmation r-set
                  continue
             
-            if self.domultipass:
-                result = self.multipass(loss_l, loss_r, left_bitvector, right_bitvector, budget, depth)
-            else: 
-                #result = self.singlepass(loss_l, loss_r, left_bitvector, right_bitvector, budget, depth)
-                #result = self.conservative_singlepass(loss_l, loss_r, left_bitvector, right_bitvector, budget, depth)
-                result = self.extremely_conservative_singlepass(loss_l, loss_r, left_bitvector, right_bitvector, budget, depth)
-
-            left_trie, right_trie = result
+            left_trie, right_trie = self.multipass(
+                loss_l, loss_r,
+                left_bitvector, right_bitvector,
+                budget, depth,
+                left_path_key=left_path_key, right_path_key=right_path_key
+            )
+        
             trie.add_split(feat, left_trie, right_trie)
 
         if self.trie_cache_strategy is not None:
-            if self.trie_cache_strategy != "compact": self.trie_cache[key] = trie
-            else: 
-                old = self.trie_cache.get(bv_key)
+            if self.trie_cache_strategy != "compact":
+                self.trie_cache[(base_key, depth, budget)] = trie
+            else:
+                old = self.trie_cache.get(base_key)
                 if old is None:
                     # initialize both slots with this trie; ok if identical
-                    self.trie_cache[bv_key] = ((depth, budget, trie), (depth, budget, trie))
+                    self.trie_cache[base_key] = ((depth, budget, trie), (depth, budget, trie))
                 else:
                     (d_max, b_at_d, trieD), (d_at_b, b_max, trieB) = old
-
                     # update max-depth slot
                     if depth > d_max:
                         d_max, b_at_d, trieD = depth, budget, trie
-
                     # update max-budget slot
                     if budget > b_max:
                         d_at_b, b_max, trieB = depth, budget, trie
+                    self.trie_cache[base_key] = ((d_max, b_at_d, trieD), (d_at_b, b_max, trieB))
 
-                    self.trie_cache[bv_key] = ((d_max, b_at_d, trieD), (d_at_b, b_max, trieB))
         return trie
 
     #@profile
-    def multipass(self, loss_l, loss_r, left_bitvector, right_bitvector, budget, depth):
+    def multipass(self, loss_l, loss_r, left_bitvector, right_bitvector, budget, depth, left_path_key=None, right_path_key=None):
         overly_tight_right_expense = loss_r # overly tight, will only find a subset of what we want
         left_subset_budget = budget - overly_tight_right_expense # too restrictive, but will find a subset of what we want (careful that empty doesn't mean anything, but this is somewhat just heuristics to see how to cut down search space)
       
         # enumerate left subtree set
-        left_subtrie = self.construct_trie(left_bitvector, depth-1, left_subset_budget) # a subset of what we want 
+        left_subtrie = self.construct_trie(left_bitvector, depth-1, left_subset_budget, path_key=left_path_key) # a subset of what we want 
     
         # compute max right budget
         min_left = left_subtrie.min_objective # the smaller the left objective, the more we can spend on the right.
         right_budget = budget - min_left
         
         # enumerate right subtree set
-        right_trie = self.construct_trie(right_bitvector, depth-1, right_budget)
+        right_trie = self.construct_trie(right_bitvector, depth-1, right_budget, path_key=right_path_key)
 
         min_right = right_trie.min_objective # assuming there was a tree, this should be the best possible tree that one can get
         left_budget = budget - min_right # nowe we have a not overly tight budget for the left side, so we can enumerate it correctly
 
         if left_budget > left_subset_budget: # TODO: CAN SHARE INFORMATION BETWEEN SUBTRIE AND TRIE, BUT THIS HARDLY EVER RUNS SO DOESN'T MATTER MUCH
-            left_trie = self.construct_trie(left_bitvector, depth-1, left_budget) # a subset of what we want
+            left_trie = self.construct_trie(left_bitvector, depth-1, left_budget, path_key=left_path_key) # a subset of what we want
         else: 
             left_trie = left_subtrie # budgets were equal, will just return the same thing
             #print("LEFT SUBSET = LEFT SET") # this happens a lot and saves time
         #left_set = left_subset # just to see if this is faster. indeed it is by a little bit
         
-        return left_trie, right_trie
-
-    # test against multipass to ensure correctness
-    def conservative_singlepass(self, loss_l, loss_r, left_bitvector, right_bitvector, budget, depth):
-        min_other_side = self.lamN
-
-        left_subset_budget = budget - min_other_side # very slow to decrease
-        left_trie = self.construct_trie(left_bitvector, depth-1, left_subset_budget)
-
-        right_budget = budget - left_trie.min_objective # exact and faster
-        if right_budget < 0:
-            right_budget = 0
-
-        right_trie = self.construct_trie(right_bitvector, depth-1, right_budget)
-
-        return left_trie, right_trie
-
-    def extremely_conservative_singlepass(self, loss_l, loss_r, left_bitvector, right_bitvector, budget, depth):
-        left_subset_budget = budget - self.lamN # no decrement
-        left_trie = self.construct_trie(left_bitvector, depth-1, left_subset_budget)
-
-        right_budget = budget - self.lamN # no decrement
-        if right_budget < 0:
-            right_budget = 0
-
-        right_trie = self.construct_trie(right_bitvector, depth-1, right_budget)
-
         return left_trie, right_trie
 
     def _build_lookahead_map(self, max_depth: int):
@@ -390,13 +412,14 @@ class LicketyRESPLIT:
         raise ValueError("prune_style must be 'Z' or 'H'")
 
     #@profile
-    def train_greedy(self, bitvector, depth_budget):
+    def train_greedy(self, bitvector, depth_budget, path_key=None):
         '''
         Requires X_train to be binary
         '''
         N = self._n
         reg = self.lamN # scaled integer
-        key = (self._key_bytes(bitvector), depth_budget)
+        key_base = self._cache_key(bitvector, path_key, where="greedy") # bytes or frozenset
+        key = (key_base, depth_budget)
         cached = self._greedy_cache_get(key)
         if cached is not None:
             return cached
@@ -433,10 +456,16 @@ class LicketyRESPLIT:
         # right_bitvector = bitvector & ~bf
         left_bitvector = np.logical_and(bitvector, bf)
         right_bitvector = np.logical_and(bitvector, np.logical_not(bf))
-            
+        if self.cache_key_mode == "literal":
+            left_path  = self._path_add(path_key, best_feature, 1)
+            right_path = self._path_add(path_key, best_feature, 0)
+        else:
+            left_path = right_path = None
+
+
         if left_bitvector.any() and right_bitvector.any():
-            left_loss = self.train_greedy(left_bitvector, depth_budget-1) # no rescaling needed given global dataset size normalization
-            right_loss = self.train_greedy(right_bitvector, depth_budget-1)
+            left_loss = self.train_greedy(left_bitvector, depth_budget-1, path_key=left_path) # no rescaling needed given global dataset size normalization
+            right_loss = self.train_greedy(right_bitvector, depth_budget-1, path_key=right_path)
                 
             if left_loss + right_loss < loss: # only split if it improves the loss
                 loss = left_loss + right_loss
@@ -445,25 +474,21 @@ class LicketyRESPLIT:
         return loss
 
     #@profile
-    def lickety_split(self, bitvector, depth_budget, k=1):
+    def lickety_split(self, bitvector, depth_budget, k=1, path_key=None):
+        key_base = self._cache_key(bitvector, path_key, where="lickety")
         if self.consistent_lookahead and self.lookahead_map is not None:
             k = self.lookahead_map.get(depth_budget, k)
-            # cache key is now independent of input k when consistent
-            key = (self._key_bytes(bitvector), int(depth_budget))
-        else: # default Z or any H
-            # original behavior (cap k by depth for caching)
+            key = (key_base, int(depth_budget))
+        else:
             k = min(k, depth_budget)
-            if self.lookahead > 1:
-                key = (self._key_bytes(bitvector), depth_budget, k)
-            else:
-                key = (self._key_bytes(bitvector), depth_budget)
-                
+            key = (key_base, depth_budget, k) if self.lookahead > 1 else (key_base, depth_budget)
+
         cached = self._lickety_cache_get(key)
         if cached is not None:
             return cached
             
         if depth_budget <= 0: # adopt leaf logic
-            a = self.train_greedy(bitvector, 0)
+            a = self.train_greedy(bitvector, 0, path_key=path_key)
             #self._lickety_cache_set(key, a) # just recompute, not expensive, especially because greedy will be cached
             return a
 
@@ -490,14 +515,20 @@ class LicketyRESPLIT:
             right = np.logical_and(bitvector, np.logical_not(bf))
             if not left.any() or not right.any():
                 continue
+            
+            if self.cache_key_mode == "literal":
+                left_path  = self._path_add(path_key, feat, 1)
+                right_path = self._path_add(path_key, feat, 0)
+            else:
+                left_path = right_path = None
 
 
             if k>1: # consider k=2. we want to choose the next split based on the best split that follows given greedy after.
-                loss_l = self.lickety_split(left,  depth_budget - 1, k-1)
-                loss_r = self.lickety_split(right, depth_budget - 1, k-1)
+                loss_l = self.lickety_split(left,  depth_budget - 1, k-1, path_key=left_path)
+                loss_r = self.lickety_split(right, depth_budget - 1, k-1, path_key=right_path)
             else: # k=1 lookahead is standard licketysplit, which chooses the best split based on greedy
-                loss_l = self.train_greedy(left,  depth_budget - 1)
-                loss_r = self.train_greedy(right, depth_budget - 1)
+                loss_l = self.train_greedy(left,  depth_budget - 1, path_key=left_path)
+                loss_r = self.train_greedy(right, depth_budget - 1, path_key=right_path)
             total = loss_l + loss_r
 
             if total < best_loss:
@@ -518,8 +549,8 @@ class LicketyRESPLIT:
         # if lookahead=0, child_k becomes 1 because we want to keep doing standard lickety split (only used in root objective calculation initially).
         
    
-        left_loss  = self.lickety_split(best_lr[0],  depth_budget - 1, child_k)
-        right_loss = self.lickety_split(best_lr[1], depth_budget - 1, child_k)
+        left_loss  = self.lickety_split(best_lr[0], depth_budget - 1, child_k, path_key=self._path_add(path_key, best_feat, 1))
+        right_loss = self.lickety_split(best_lr[1], depth_budget - 1, child_k, path_key=self._path_add(path_key, best_feat, 0))
         lickety_loss = left_loss + right_loss
 
         #node = Node(feature=best_feat, left_child=left_node, right_child=right_node)
