@@ -351,7 +351,7 @@ class LicketyRESPLIT:
                 else:
                     (d_max, b_at_d, trieD), (d_at_b, b_max, trieB) = old
                     # update max-depth slot
-                    if if (depth > d_max) or (depth == d_max and budget > b_at_d): # the second condition is so we can have better coverage and serve as a look up for more things
+                    if (depth > d_max) or (depth == d_max and budget > b_at_d): # the second condition is so we can have better coverage and serve as a look up for more things
                         d_max, b_at_d, trieD = depth, budget, trie
                     # update max-budget slot
                     if (budget > b_max) or (budget == b_max and depth > d_at_b):
