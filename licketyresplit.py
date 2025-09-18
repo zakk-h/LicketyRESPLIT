@@ -237,7 +237,7 @@ class LicketyRESPLIT:
                 entry = self.trie_cache.get(base_key)
                 if entry is not None:
                     (d_max, b_at_d, trieD), (d_at_b, b_max, trieB) = entry
-                    # prefer whichever qualifies as a superset; either is fine
+                    # prefer whichever qualifies as a superset; either is fine - it is possible that none will work because bigger budget and smaller depth or vice versa
                     if d_max >= depth and b_at_d >= budget:
                         return trieD.truncated_copy(max_depth=depth, budget=budget)
                     if d_at_b >= depth and b_max >= budget:
@@ -351,10 +351,10 @@ class LicketyRESPLIT:
                 else:
                     (d_max, b_at_d, trieD), (d_at_b, b_max, trieB) = old
                     # update max-depth slot
-                    if depth > d_max:
+                    if if (depth > d_max) or (depth == d_max and budget > b_at_d): # the second condition is so we can have better coverage and serve as a look up for more things
                         d_max, b_at_d, trieD = depth, budget, trie
                     # update max-budget slot
-                    if budget > b_max:
+                    if (budget > b_max) or (budget == b_max and depth > d_at_b):
                         d_at_b, b_max, trieB = depth, budget, trie
                     self.trie_cache[base_key] = ((d_max, b_at_d, trieD), (d_at_b, b_max, trieB))
 

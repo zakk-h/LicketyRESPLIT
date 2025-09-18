@@ -90,6 +90,7 @@ Any reasonable input will suffice and be handled internally, however, we note de
 - **None**: no memoization of subtries
 - **"compact"**: cache two "envelopes" per key — the largest depth seen and the largest budget seen — and auto-truncate for smaller queries
 - **"superset"**: actively probe supersets (slightly heavier) to reuse work
+- **exact**: cache each (base_key, depth, budget) triple explicitly with no reuse across settings
 
 ## Lookahead and Pruning
 
