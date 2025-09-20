@@ -368,45 +368,6 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
     
 
 if __name__ == "__main__":
-    #main("bike_binarized_many.csv", "lickety", reg=0.01, depth=5, mult=0.01, lookahead_k=1, prune_style="H", consistent_lookahead=False, better_than_greedy=False, use_gosdt_objective=False, try_greedy_first=False, trie_cache_strategy = None, cache_greedy=False, cache_lickety=False, cache_packbits=False, cache_key_mode="bitvector", stop_caching_at_depth=0)
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, default="bike_binarized.csv")
-    parser.add_argument("--algo", type=str, choices=["lickety", "resplit", "treefarms"], default="lickety")
-    parser.add_argument("--reg", type=float, default=0.007)
-    parser.add_argument("--depth", type=int, default=7)
-    parser.add_argument("--mult", type=float, default=0.02)
-    parser.add_argument("--lookahead_k", type=int, default=1)
-    parser.add_argument("--prune_style", type=str, default="H")
-    parser.add_argument("--consistent_lookahead", type=lambda s: s.lower() == "true", default=False)
-    parser.add_argument("--better_than_greedy", type=lambda s: s.lower() == "true", default=False)
-    parser.add_argument("--use_gosdt_objective", type=lambda s: s.lower() == "true", default=False)
-    parser.add_argument("--try_greedy_first", type=lambda s: s.lower() == "true", default=False)
-    parser.add_argument("--trie_cache_strategy", type=str, default="compact")
-    parser.add_argument("--multiplicative_slack", type=float, default=0.00)
-    parser.add_argument("--cache_greedy", type=lambda s: s.lower() == "true", default=True)
-    parser.add_argument("--cache_lickety", type=lambda s: s.lower() == "true", default=True)
-    parser.add_argument("--cache_packbits", type=lambda s: s.lower() == "true", default=True)
-    parser.add_argument("--cache_key_mode", type=str, default="bitvector")
-    parser.add_argument("--stop_caching_at_depth", type=int, default=0)
-
-    args = parser.parse_args()
-    main(
-        data_path=args.data,
-        algo=args.algo,
-        reg=args.reg,
-        depth=args.depth,
-        mult=args.mult,
-        use_gosdt_objective=args.use_gosdt_objective,
-        better_than_greedy=args.better_than_greedy,
-        lookahead_k=args.lookahead_k,
-        prune_style=args.prune_style,
-        consistent_lookahead=args.consistent_lookahead,
-        try_greedy_first=args.try_greedy_first,
-        trie_cache_strategy=args.trie_cache_strategy,
-        multiplicative_slack=args.multiplicative_slack,
-        cache_greedy=args.cache_greedy,
-        cache_lickety=args.cache_lickety,
-        cache_packbits=args.cache_packbits,
-        cache_key_mode=args.cache_key_mode,
-        stop_caching_at_depth=args.stop_caching_at_depth
-    )
+    main("bike_binarized_many.csv", "lickety", reg=0.005, depth=10, mult=0.015, lookahead_k=1, prune_style="H", consistent_lookahead=False, better_than_greedy=False, use_gosdt_objective=False, try_greedy_first=False, trie_cache_strategy = "superset", cache_greedy=True, cache_lickety=True, cache_packbits=True, cache_key_mode="bitvector", stop_caching_at_depth=0)
+    main("bike_binarized_many.csv", "lickety", reg=0.005, depth=10, mult=0.015, lookahead_k=2, prune_style="H", consistent_lookahead=False, better_than_greedy=False, use_gosdt_objective=False, try_greedy_first=False, trie_cache_strategy = "superset", cache_greedy=True, cache_lickety=True, cache_packbits=True, cache_key_mode="bitvector", stop_caching_at_depth=0)
+    main("bike_binarized_many.csv", "lickety", reg=0.005, depth=10, mult=0.015, lookahead_k=10, prune_style="H", consistent_lookahead=False, better_than_greedy=False, use_gosdt_objective=False, try_greedy_first=False, trie_cache_strategy = "superset", cache_greedy=True, cache_lickety=True, cache_packbits=True, cache_key_mode="bitvector", stop_caching_at_depth=0)

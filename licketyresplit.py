@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 import time
 from tqdm import tqdm
-from split import GOSDTClassifier
 #from split._tree import Node, Leaf
 from Tree import Node, Leaf
 from split import SPLIT, LicketySPLIT
@@ -44,7 +43,7 @@ class LicketyRESPLIT:
             If True, uses ThresholdGuessBinarizer for binarization.
             If False, requires binary input data.
     '''
-    def __init__(self, config, binarize=False, lookahead=1, multipass=True, consistent_lookahead = False, prune_style = "H", gbdt_n_est=50, gbdt_max_depth=1, optimal=False, pruning=True, better_than_greedy=False, try_greedy_first=False, trie_cache_strategy="compact", multiplicative_slack=0, cache_greedy=True, cache_lickety=True, cache_key_mode="bitvector", cache_packbits=None):
+    def __init__(self, config, binarize=False, lookahead=1, multipass=True, consistent_lookahead = False, prune_style = "H", gbdt_n_est=50, gbdt_max_depth=1, optimal=False, pruning=True, better_than_greedy=False, try_greedy_first=False, trie_cache_strategy="compact", multiplicative_slack=0, cache_greedy=True, cache_lickety=True, cache_key_mode="bitvector", cache_packbits=None, stop_caching_at_depth=-1):
         self.config = config
         self.domultipass = multipass
         self.lookahead = lookahead
@@ -82,6 +81,9 @@ class LicketyRESPLIT:
             self.cache_packbits = cache_packbits
         else:
             self.cache_packbits = True
+        self.stop_caching_at_depth = stop_caching_at_depth
+        self.use_shared_obj_cache = False
+        self.lickety_greedy_shared_cache = {}
 
     #@profile
     def fit(self, X, y):
@@ -169,7 +171,7 @@ class LicketyRESPLIT:
     def count_unique_prediction_vectors(self, X=None, preds=None, max_obj=None, min_obj=None, inclusive=True):
         if preds is None:
             if X is None:
-                if X is None: X = self.X_bool
+                X = self.X_bool
             preds = self.get_all_predictions(X, max_obj=max_obj, min_obj=min_obj, inclusive=inclusive, stack=True)
         if isinstance(preds, list):
             preds = np.stack(preds, axis=0)
@@ -177,32 +179,56 @@ class LicketyRESPLIT:
         return np.unique(preds, axis=0).shape[0]
 
     #@profile
-    def _key_bytes(self, bv, where): # for memory-efficiency - if ive seen this exact byte string b before, give me the one I stored earlier.
+    def _key_bytes(self, bv): # for memory-efficiency - if ive seen this exact byte string b before, give me the one I stored earlier.
         bv = np.ascontiguousarray(bv, dtype=np.bool_)
         b = np.packbits(bv, bitorder="little").tobytes()
-        cache_on = (
-            (where == "greedy"  and self.cache_greedy) or
-            (where == "lickety" and self.cache_lickety) or
-            (where == "trie"    and bool(self.trie_cache_strategy))
-        )
-        if self.cache_packbits and cache_on:
+        if self.cache_packbits:
             return self._pack_cache.setdefault(b, b)
         return b
 
     def _greedy_cache_get(self, key):
-        return self.greedy_cache.get(key) if self.cache_greedy else None
-
+        if not self.cache_greedy:
+            return None
+        if not self.use_shared_obj_cache: return self.greedy_cache.get(key)
+        tup = self.lickety_greedy_shared_cache.get(key)
+        if tup is None: return None
+        return None if tup[0] == -1 else tup[0]
 
     def _greedy_cache_set(self, key, val):
-        if self.cache_greedy:
+        if not self.cache_greedy: return
+        val = int(val)
+        if not self.use_shared_obj_cache:
             self.greedy_cache[key] = val
+            return
+        tup = self.lickety_greedy_shared_cache.get(key)
+        if tup is None:
+            self.lickety_greedy_shared_cache[key] = (val, -1)
+        else:
+            if tup[0] == -1:
+                self.lickety_greedy_shared_cache[key] = (val, tup[1])
+        return
 
     def _lickety_cache_get(self, key):
-        return self.lickety_cache.get(key) if self.cache_lickety else None
+        if not self.cache_lickety:
+            return None
+        if not self.use_shared_obj_cache: return self.lickety_cache.get(key)
+        tup = self.lickety_greedy_shared_cache.get(key)
+        if tup is None: return None
+        return None if tup[1] == -1 else tup[1]
 
     def _lickety_cache_set(self, key, val):
-        if self.cache_lickety:
+        if not self.cache_lickety: return
+        val = int(val)
+        if not self.use_shared_obj_cache:
             self.lickety_cache[key] = val
+            return
+        tup = self.lickety_greedy_shared_cache.get(key)
+        if tup is None:
+            self.lickety_greedy_shared_cache[key] = (-1, val)
+        else:
+            if tup[1] == -1:
+                self.lickety_greedy_shared_cache[key] = (tup[0], val)
+        return
 
     def _encode_lit(self, feat, val_bit): # doubling the feature index and maybe adding 1 or not, so mapping (feature, on/off) to an integer
         return (int(feat) << 1) | (int(val_bit) & 1)
@@ -213,7 +239,7 @@ class LicketyRESPLIT:
             return frozenset((lit,))
         return frozenset((*path_key, lit))
 
-    def _cache_key(self, bitvector, path_key, where):
+    def _cache_key(self, bitvector, path_key):
         """
         - 'bitvector': canonical packed-bytes (interned)
         - 'literal'  : order-invariant frozenset of encoded literals
@@ -221,13 +247,15 @@ class LicketyRESPLIT:
         if self.cache_key_mode == "literal":
             return path_key if path_key is not None else frozenset()
         # default: bitvector
-        return self._key_bytes(bitvector, where=where)
+        return self._key_bytes(bitvector)
 
     #@profile
     def construct_trie(self, bitvector, depth, budget, path_key=None):
-        base_key = self._cache_key(bitvector, path_key, where="trie")  # bytes when "bitvector", frozenset when "literal"
+        if self.trie_cache_strategy and depth > self.stop_caching_at_depth:
+            base_key = self._cache_key(bitvector, path_key) # bytes when "bitvector", frozenset when "literal"
+        else: base_key = None  
 
-        if self.trie_cache_strategy:
+        if self.trie_cache_strategy and depth > self.stop_caching_at_depth:
             if self.trie_cache_strategy != "compact":
                 key = (base_key, depth, budget)
                 hit = self.trie_cache.get(key)
@@ -340,7 +368,7 @@ class LicketyRESPLIT:
         
             trie.add_split(feat, left_trie, right_trie)
 
-        if self.trie_cache_strategy is not None:
+        if self.trie_cache_strategy is not None and depth > self.stop_caching_at_depth:
             if self.trie_cache_strategy != "compact":
                 self.trie_cache[(base_key, depth, budget)] = trie
             else:
@@ -413,16 +441,15 @@ class LicketyRESPLIT:
 
     #@profile
     def train_greedy(self, bitvector, depth_budget, path_key=None):
-        '''
-        Requires X_train to be binary
-        '''
         N = self._n
         reg = self.lamN # scaled integer
-        key_base = self._cache_key(bitvector, path_key, where="greedy") # bytes or frozenset
-        key = (key_base, depth_budget)
-        cached = self._greedy_cache_get(key)
-        if cached is not None:
-            return cached
+        do_cache_g = self.cache_greedy and (depth_budget > self.stop_caching_at_depth)
+        if do_cache_g:
+            key_base = self._cache_key(bitvector, path_key)
+            key = (key_base, depth_budget)
+            cached = self._greedy_cache_get(key)
+            if cached is not None:
+                return cached
         y_train = self.y_full[bitvector]
         n_sub = y_train.size # needed for a better way to check if the mean of the subproblem is above 0.5 or not
 
@@ -439,17 +466,17 @@ class LicketyRESPLIT:
         loss = reg + errors # integer
 
         if depth_budget <= 0: # I HAVE ADJUSTED THIS TO TAKE DEPTH 0 BEING ROOT CONVENTION
-            self._greedy_cache_set(key, loss)
+            if do_cache_g: self._greedy_cache_set(key, loss)
             return loss
 
         if loss <= 2 * reg: # errors==0 is a special case of this
-            self._greedy_cache_set(key, loss)
+            if do_cache_g: self._greedy_cache_set(key, loss)
             return loss
 
 
         best_feature = self.find_best_feature_to_split_on(bitvector)
         if best_feature is None:
-            self._greedy_cache_set(key, loss)
+            if do_cache_g: self._greedy_cache_set(key, loss)
             return loss 
         bf = self.X_bool[:, best_feature]
         # left_bitvector  = bitvector & bf
@@ -470,22 +497,24 @@ class LicketyRESPLIT:
             if left_loss + right_loss < loss: # only split if it improves the loss
                 loss = left_loss + right_loss
             
-        self._greedy_cache_set(key, loss)
+        if do_cache_g: self._greedy_cache_set(key, loss)
         return loss
 
     #@profile
     def lickety_split(self, bitvector, depth_budget, k=1, path_key=None):
-        key_base = self._cache_key(bitvector, path_key, where="lickety")
-        if self.consistent_lookahead and self.lookahead_map is not None:
-            k = self.lookahead_map.get(depth_budget, k)
-            key = (key_base, int(depth_budget))
-        else:
-            k = min(k, depth_budget)
-            key = (key_base, depth_budget, k) if self.lookahead > 1 else (key_base, depth_budget)
+        do_cache_l = self.cache_lickety and (depth_budget > self.stop_caching_at_depth)
+        if do_cache_l:
+            key_base = self._cache_key(bitvector, path_key)
+            if self.consistent_lookahead and self.lookahead_map is not None:
+                k = self.lookahead_map.get(depth_budget, k)
+                key = (key_base, int(depth_budget))
+            else:
+                k = min(k, depth_budget)
+                key = (key_base, depth_budget, k) if self.lookahead > 1 else (key_base, depth_budget)
 
-        cached = self._lickety_cache_get(key)
-        if cached is not None:
-            return cached
+            cached = self._lickety_cache_get(key)
+            if cached is not None:
+                return cached
             
         if depth_budget <= 0: # adopt leaf logic
             a = self.train_greedy(bitvector, 0, path_key=path_key)
@@ -500,7 +529,7 @@ class LicketyRESPLIT:
         #leaf_node = Leaf(prediction=pred, loss=leaf_loss)
 
         if leaf_loss <= 2 * self.lamN:
-            self._lickety_cache_set(key, leaf_loss)
+            if do_cache_l: self._lickety_cache_set(key, leaf_loss)
             return leaf_loss
 
         
@@ -538,7 +567,7 @@ class LicketyRESPLIT:
 
         if best_feat is None or best_loss >= leaf_loss:
             # no useful split (i.e the X are constant for every split, so every split was meaningless) OR split doesn't beat the leaf 
-            self._lickety_cache_set(key, leaf_loss)
+            if do_cache_l: self._lickety_cache_set(key, leaf_loss)
             return leaf_loss
 
         if self.consistent_lookahead and self.lookahead_map is not None:
@@ -556,7 +585,7 @@ class LicketyRESPLIT:
         #node = Node(feature=best_feat, left_child=left_node, right_child=right_node)
         #node.loss = lickety_loss
 
-        self._lickety_cache_set(key, lickety_loss)
+        if do_cache_l: self._lickety_cache_set(key, lickety_loss)
         return lickety_loss
 
     #@profile
