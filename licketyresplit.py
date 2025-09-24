@@ -13,10 +13,9 @@ import bisect
 import math
 
 # TODO
-# Add lookahead "consistency" flag. The idea is right now, you will be solving the same problems but with a different lookahead.
-# If you start with depth 6 and lookahead 2, when you recurse in create_trie, you will call with depth 5 and lookahead 2, and so on.
-# The idea is to make a function depth->lookahead_used that isn't neccessarily injective.
-# D8 L2, D7 L1, D6 L2, D5 L1, D4 L2 and so on if lookahead was 2. So cycle through every possibly lookahead value so it is consistent, instead of solving the same lookahead optimization just offset.
+# Consider restricting the feature set for the oracles - essentially have two different binarizations (one with say 40 features, one with 200)
+# Use the 40 feature set for the pruning oracles which will reduce caching by a lot and also reduce runtime by a lot, while not making the oracles much worse. 
+# For instance, having extra features means licketysplit can go down the wrong path, and more features doesn't seem to improve licketysplit objective in some test datasets.
 
 def count_leaves(node):
     if isinstance(node, Leaf):
@@ -43,7 +42,7 @@ class LicketyRESPLIT:
             If True, uses ThresholdGuessBinarizer for binarization.
             If False, requires binary input data.
     '''
-    def __init__(self, config, binarize=False, lookahead=1, multipass=True, consistent_lookahead = False, prune_style = "H", gbdt_n_est=50, gbdt_max_depth=1, optimal=False, pruning=True, better_than_greedy=False, try_greedy_first=False, trie_cache_strategy="compact", multiplicative_slack=0, cache_greedy=True, cache_lickety=True, cache_key_mode="bitvector", cache_packbits=None, stop_caching_at_depth=-1):
+    def __init__(self, config, binarize=False, lookahead=1, multipass=True, consistent_lookahead = False, prune_style = "H", gbdt_n_est=50, gbdt_max_depth=1, optimal=False, pruning=True, better_than_greedy=False, try_greedy_first=False, trie_cache_strategy="compact", multiplicative_slack=0, cache_greedy=True, cache_lickety=True, cache_key_mode="bitvector", cache_packbits=None, stop_caching_at_depth=-1, oracle_top_k=None):
         self.config = config
         self.domultipass = multipass
         self.lookahead = lookahead
@@ -84,6 +83,7 @@ class LicketyRESPLIT:
         self.stop_caching_at_depth = stop_caching_at_depth
         self.use_shared_obj_cache = False
         self.lickety_greedy_shared_cache = {}
+        self.oracle_top_k = oracle_top_k
 
     #@profile
     def fit(self, X, y):
@@ -500,6 +500,14 @@ class LicketyRESPLIT:
         if do_cache_g: self._greedy_cache_set(key, loss)
         return loss
 
+
+
+    def _oracle_feature_range(self):
+        d = self.X_bool.shape[1]
+        if self.oracle_top_k is None:
+            return range(d)
+        return range(min(self.oracle_top_k, d))
+
     #@profile
     def lickety_split(self, bitvector, depth_budget, k=1, path_key=None):
         do_cache_l = self.cache_lickety and (depth_budget > self.stop_caching_at_depth)
@@ -537,8 +545,8 @@ class LicketyRESPLIT:
         best_feat = None
         best_lr = (None, None)
 
-        d = self.X_bool.shape[1]
-        for feat in range(d):
+        #d = self.X_bool.shape[1]
+        for feat in self._oracle_feature_range():
             bf = self.X_bool[:, feat]
             left = np.logical_and(bitvector, bf)
             right = np.logical_and(bitvector, np.logical_not(bf))
@@ -605,6 +613,14 @@ class LicketyRESPLIT:
         pos_right    = pos_total - pos_left
 
         valid = (left_counts > 0) & (right_counts > 0)
+
+        # Restrict to first K features for oracle usage
+        if self.oracle_top_k is not None:
+            d = X.shape[1]
+            allowed = np.zeros(d, dtype=bool)
+            allowed[:min(self.oracle_top_k, d)] = True
+            valid = valid & allowed  # CHANGED
+            
         if not np.any(valid):
             return None
 
