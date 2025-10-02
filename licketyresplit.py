@@ -8,7 +8,7 @@ from tqdm import tqdm
 from Tree import Node, Leaf
 from split import SPLIT, LicketySPLIT
 from split import ThresholdGuessBinarizer, GOSDTClassifier
-from Trie import TreeTrieNode, SplitNode
+from Trie import TreeTrieNode, SplitNode, SpecializedDepth2Node
 import bisect
 import math
 
@@ -84,6 +84,7 @@ class LicketyRESPLIT:
         self.use_shared_obj_cache = False
         self.lickety_greedy_shared_cache = {}
         self.oracle_top_k = oracle_top_k
+        self._depth12_stats_cache = {}  # key -> {"n_pos","n_neg","P1","N1","P2","N2"}
 
     #@profile
     def fit(self, X, y):
@@ -249,8 +250,99 @@ class LicketyRESPLIT:
         # default: bitvector
         return self._key_bytes(bitvector)
 
+    def _compute_depth12_counts(self, bitvector, need_pairs=False):
+        key = self._cache_key(bitvector, None)
+        entry = self._depth12_stats_cache.get(key)
+
+        if entry is not None:
+            if need_pairs and (entry["P2"] is None or entry["N2"] is None):
+                # we need to recompute pairs; we will reuse singles already present
+                pass
+            else: # we have succificient information - either everything we need or we don't need pairs as we are depth 1
+                return entry
+
+        bv = np.asarray(bitvector, dtype=np.bool_)
+        y_sub = self.y_full[bv].astype(np.uint8, copy=False)
+        n_sub = int(y_sub.size)
+        n_pos = int(y_sub.sum())
+        n_neg = n_sub - n_pos
+
+        X_sub = self.X_bool[bv]
+        d = X_sub.shape[1]
+
+        pos_mask = (y_sub == 1)
+        neg_mask = ~pos_mask
+
+        Xp64 = X_sub[pos_mask].astype(np.int64, copy=False) if n_pos > 0 else np.zeros((0, d), dtype=np.int64)
+        Xn64 = X_sub[neg_mask].astype(np.int64, copy=False) if n_neg > 0 else np.zeros((0, d), dtype=np.int64)
+
+        # we should load these if we have them
+        P1 = entry.get("P1") if entry and entry.get("P1") is not None else Xp64.sum(axis=0)
+        N1 = entry.get("N1") if entry and entry.get("N1") is not None else Xn64.sum(axis=0)
+
+        P2 = N2 = None
+        if need_pairs:
+            if n_pos > 0:
+                P2 = Xp64.T @ Xp64 # number of positive rows with feature i and feature j true in entry (i,j)
+            else:
+                P2 = np.zeros((d, d), dtype=np.int64)
+            if n_neg > 0:
+                N2 = Xn64.T @ Xn64
+            else:
+                N2 = np.zeros((d, d), dtype=np.int64)
+
+        out = {
+            "n_pos": n_pos,
+            "n_neg": n_neg,
+            "P1": P1,
+            "N1": N1,
+            "P2": P2,
+            "N2": N2,
+        }
+        # save/upgrade cache
+        if entry is None:
+            self._depth12_stats_cache[key] = out
+        else:
+            if entry.get("P2") is None:
+                entry["P2"] = out["P2"]
+            if entry.get("N2") is None:
+                entry["N2"] = out["N2"]
+            if entry.get("P1") is None:
+                entry["P1"] = P1
+            if entry.get("N1") is None:
+                entry["N1"] = N1
+            self._depth12_stats_cache[key] = entry
+
+        return out
+
+    def specialized_trie_depth_2(self, bitvector, depth, budget):
+        need_pairs = (depth == 2)
+        stats = self._compute_depth12_counts(bitvector, need_pairs=need_pairs)
+
+        n_pos = stats["n_pos"]
+        n_neg = stats["n_neg"]
+        P1    = stats["P1"]
+        N1    = stats["N1"]
+        P2    = stats["P2"]
+        N2    = stats["N2"]
+
+        node = SpecializedDepth2Node(
+            budget=budget,
+            depth=depth,
+            lamN=self.lamN,
+            n_pos=int(n_pos),
+            n_neg=int(n_neg),
+            P1=P1,
+            N1=N1,
+            P2=P2, # maybe none
+            N2=N2 # maybe none
+        )
+        return node
+
     #@profile
     def construct_trie(self, bitvector, depth, budget, path_key=None):
+        if depth == 1 or depth == 2: return self.specialized_trie_depth_2(bitvector, depth, budget) # no more supporting path key
+
         if self.trie_cache_strategy and depth > self.stop_caching_at_depth:
             base_key = self._cache_key(bitvector, path_key) # bytes when "bitvector", frozenset when "literal"
         else: base_key = None  
@@ -328,8 +420,8 @@ class LicketyRESPLIT:
             bf = self.X_bool[:, feat]
             # left_bitvector  = bitvector & bf
             # right_bitvector = bitvector & ~bf
-            left_bitvector = np.logical_and(bitvector, bf)
-            right_bitvector = np.logical_and(bitvector, np.logical_not(bf))
+            left_bitvector = bitvector & bf
+            right_bitvector = bitvector & ~bf
             if not left_bitvector.any() or not right_bitvector.any():
                 continue
             if self.cache_key_mode == "literal":
@@ -481,8 +573,8 @@ class LicketyRESPLIT:
         bf = self.X_bool[:, best_feature]
         # left_bitvector  = bitvector & bf
         # right_bitvector = bitvector & ~bf
-        left_bitvector = np.logical_and(bitvector, bf)
-        right_bitvector = np.logical_and(bitvector, np.logical_not(bf))
+        left_bitvector = bitvector & bf
+        right_bitvector = bitvector & ~bf
         if self.cache_key_mode == "literal":
             left_path  = self._path_add(path_key, best_feature, 1)
             right_path = self._path_add(path_key, best_feature, 0)
@@ -545,11 +637,11 @@ class LicketyRESPLIT:
         best_feat = None
         best_lr = (None, None)
 
-        #d = self.X_bool.shape[1]
-        for feat in self._oracle_feature_range():
+        d = self.X_bool.shape[1]
+        for feat in range(d):
             bf = self.X_bool[:, feat]
-            left = np.logical_and(bitvector, bf)
-            right = np.logical_and(bitvector, np.logical_not(bf))
+            left = bitvector & bf
+            right = bitvector & ~bf
             if not left.any() or not right.any():
                 continue
             
@@ -613,14 +705,6 @@ class LicketyRESPLIT:
         pos_right    = pos_total - pos_left
 
         valid = (left_counts > 0) & (right_counts > 0)
-
-        # Restrict to first K features for oracle usage
-        if self.oracle_top_k is not None:
-            d = X.shape[1]
-            allowed = np.zeros(d, dtype=bool)
-            allowed[:min(self.oracle_top_k, d)] = True
-            valid = valid & allowed  # CHANGED
-            
         if not np.any(valid):
             return None
 
@@ -651,7 +735,7 @@ class LicketyRESPLIT:
         valid_idx = np.where(valid)[0]
         best_idx  = int(valid_idx[np.argmax(gain_valid)])
         return best_idx
-
+        
     def objective_optimal(self, bitvector, depth_budget):
         if not np.any(bitvector):
             return 0

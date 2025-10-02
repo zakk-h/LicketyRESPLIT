@@ -14,6 +14,9 @@ from treefarms import TREEFARMS
 from gosdt import GOSDTClassifier
 from Tree import Node, Leaf
 
+import os
+from pathlib import Path
+
 def plot_tree(root, feature_names=None, figsize=(12, 6)):
     positions = {}
     x_counter = [0]
@@ -291,23 +294,6 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
 
     X, y = load_dataset(data_path)
 
-    X_many, y_many = X, y
-    X_base, _ = load_dataset("bike_binarized_small.csv")
-
-    base_cols = list(X_base.columns)
-    many_cols = list(X_many.columns)
-
-    base_set = set(base_cols)
-    inter_cols = [c for c in many_cols if c in base_set]
-    rest_cols = [c for c in many_cols if c not in base_set]
-
-    # reordered dataframe: intersection (important columns) first, the rest after
-    X_many_reordered = X_many[inter_cols + rest_cols]
-    important_k = len(inter_cols)
-    print(important_k)
-
-    X, y = X_many_reordered, y_many
-
     if algo == "resplit":
         target = run_resplit
         kwargs = dict(X=X, y=y, reg=reg, mult=mult, depth=depth)
@@ -327,7 +313,7 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
         del X, y, X_arr, y_arr
         gc.collect()
         target = run_lickety
-        kwargs = dict(X=X_bool, y=y_uint8, reg=reg, mult=mult, depth=depth, best_objective=best_obj, lookahead=lookahead_k, prune_style=prune_style, consistent_lookahead=consistent_lookahead, better_than_greedy=better_than_greedy, try_greedy_first=try_greedy_first, trie_cache_strategy = trie_cache_strategy, multiplicative_slack=multiplicative_slack, cache_greedy=cache_greedy, cache_lickety=cache_lickety, cache_packbits=cache_packbits, cache_key_mode=cache_key_mode, stop_caching_at_depth=stop_caching_at_depth, oracle_top_k=important_k)
+        kwargs = dict(X=X_bool, y=y_uint8, reg=reg, mult=mult, depth=depth, best_objective=best_obj, lookahead=lookahead_k, prune_style=prune_style, consistent_lookahead=consistent_lookahead, better_than_greedy=better_than_greedy, try_greedy_first=try_greedy_first, trie_cache_strategy = trie_cache_strategy, multiplicative_slack=multiplicative_slack, cache_greedy=cache_greedy, cache_lickety=cache_lickety, cache_packbits=cache_packbits, cache_key_mode=cache_key_mode, stop_caching_at_depth=stop_caching_at_depth)
 
     elif algo == "treefarms":
         target = run_treefarms
@@ -337,7 +323,7 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
         raise ValueError(f"Unknown algo: {algo}")
 
     baseline_mb = memory_usage(-1, interval=0.05, timeout=1)[0]
-    # Measure peak RSS during the call (includes child processes if any)
+    # measure peak RSS during the call (includes child processes if any)
     peak_mb, retval = memory_usage(
         (target, (), kwargs),
         max_usage=True,
@@ -389,11 +375,11 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
 if __name__ == "__main__":
     #main("bike_binarized_many.csv", "lickety", reg=0.01, depth=5, mult=0.01, lookahead_k=1, prune_style="H", consistent_lookahead=False, better_than_greedy=False, use_gosdt_objective=False, try_greedy_first=False, trie_cache_strategy = None, cache_greedy=False, cache_lickety=False, cache_packbits=False, cache_key_mode="bitvector", stop_caching_at_depth=0)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, default="bike_binarized_many.csv")
+    parser.add_argument("--data", type=str, default="compas_binarized.csv")
     parser.add_argument("--algo", type=str, choices=["lickety", "resplit", "treefarms"], default="lickety")
-    parser.add_argument("--reg", type=float, default=0.01)
+    parser.add_argument("--reg", type=float, default=0.005)
     parser.add_argument("--depth", type=int, default=5)
-    parser.add_argument("--mult", type=float, default=0.03)
+    parser.add_argument("--mult", type=float, default=0.01)
     parser.add_argument("--lookahead_k", type=int, default=1)
     parser.add_argument("--prune_style", type=str, default="H")
     parser.add_argument("--consistent_lookahead", type=lambda s: s.lower() == "true", default=False)
@@ -401,7 +387,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_gosdt_objective", type=lambda s: s.lower() == "true", default=False)
     parser.add_argument("--try_greedy_first", type=lambda s: s.lower() == "true", default=False)
     parser.add_argument("--trie_cache_strategy", type=str, default="compact")
-    parser.add_argument("--multiplicative_slack", type=float, default=0.03)
+    parser.add_argument("--multiplicative_slack", type=float, default=0.00)
     parser.add_argument("--cache_greedy", type=lambda s: s.lower() == "true", default=True)
     parser.add_argument("--cache_lickety", type=lambda s: s.lower() == "true", default=True)
     parser.add_argument("--cache_packbits", type=lambda s: s.lower() == "true", default=True)
@@ -409,7 +395,7 @@ if __name__ == "__main__":
     parser.add_argument("--stop_caching_at_depth", type=int, default=0)
 
     args = parser.parse_args()
-    main(
+    duration_s, peak_mb, delta_mb, n_trees = main(
         data_path=args.data,
         algo=args.algo,
         reg=args.reg,
@@ -429,3 +415,42 @@ if __name__ == "__main__":
         cache_key_mode=args.cache_key_mode,
         stop_caching_at_depth=args.stop_caching_at_depth
     )
+
+    def _slug(v):
+        if isinstance(v, bool):
+            return "1" if v else "0"
+        s = str(v)
+        s = s.replace(os.sep, "_").replace("/", "_").replace(" ", "")
+        s = s.replace(".", "p").replace("+", "plus").replace("-", "m")
+        return s
+
+    # stem = Path(args.data).stem
+    # fname = (
+    #     f"{args.algo}"
+    #     f"__data-{_slug(stem)}"
+    #     f"__reg-{_slug(args.reg)}"
+    #     f"__depth-{_slug(args.depth)}"
+    #     f"__mult-{_slug(args.mult)}"
+    #     f"__lookahead-{_slug(args.lookahead_k)}"
+    #     f"__prune-{_slug(args.prune_style)}"
+    #     f"__consLook-{_slug(args.consistent_lookahead)}"
+    #     f"__btg-{_slug(args.better_than_greedy)}"
+    #     f"__gosdt-{_slug(args.use_gosdt_objective)}"
+    #     f"__tryGreedy-{_slug(args.try_greedy_first)}"
+    #     f"__trie-{_slug(args.trie_cache_strategy)}"
+    #     f"__mslack-{_slug(args.multiplicative_slack)}"
+    #     f"__cg-{_slug(args.cache_greedy)}"
+    #     f"__cl-{_slug(args.cache_lickety)}"
+    #     f"__cp-{_slug(args.cache_packbits)}"
+    #     f"__ckm-{_slug(args.cache_key_mode)}"
+    #     f"__stopCache-{_slug(args.stop_caching_at_depth)}"
+    #     f".csv"
+    # )
+
+    # out_dir = Path("Outputs")
+    # out_dir.mkdir(parents=True, exist_ok=True)
+    # out_path = out_dir / fname
+
+    # with open(out_path, "w", encoding="utf-8") as f:
+    #     f.write("duration_s,peak_mb,delta_mb,num_trees\n")
+    #     f.write(f"{duration_s:.6f},{peak_mb:.2f},{delta_mb:.2f},{n_trees}\n")

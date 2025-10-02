@@ -420,4 +420,207 @@ def tree_structure_signature(tree): # nested tuples can be hashed
     else:
         raise ValueError("Unknown tree type: %s" % type(tree))
 
-    
+
+class SpecializedDepth2Node:
+    __slots__ = ("budget", "depth", "lamN", "n_pos", "n_neg",
+                 "P1", "N1", "P2", "N2",
+                 "objectives", "min_objective", "_active")
+    def __init__(self, budget, depth, lamN, n_pos, n_neg, P1, N1, P2=None, N2=None, top_k_idx=None):
+        assert depth in (1, 2)
+        
+        self.budget = int(budget)
+        self.depth = int(depth)
+        self.lamN = int(lamN)
+        self.n_pos = int(n_pos)
+        self.n_neg = int(n_neg)
+        self.P1 = np.asarray(P1, dtype=np.int32)
+        self.N1 = np.asarray(N1, dtype=np.int32)
+        self.P2 = None if P2 is None else np.asarray(P2, dtype=np.int32)
+        self.N2 = None if N2 is None else np.asarray(N2, dtype=np.int32)
+        d = self.P1.shape[0]
+        self._active = np.arange(d, dtype=np.int32)
+
+        self.objectives = Counter()
+        self.min_objective = float("inf")
+
+
+        self._enumerate_depth0()
+        if self.depth >= 1:
+            self._enumerate_depth1_fast()
+        if self.depth >= 2:
+            self._enumerate_depth2_fast()
+
+    def _bulk_add_losses(self, losses: np.ndarray):
+        if losses.size == 0:
+            return
+        losses = losses[losses <= self.budget]
+        if losses.size == 0:
+            return
+        vals, cnts = np.unique(losses.astype(np.int64, copy=False), return_counts=True)
+        self.objectives.update(dict(zip(vals.tolist(), cnts.tolist())))
+        m = int(vals.min())
+        if m < self.min_objective:
+            self.min_objective = m
+
+    def _enumerate_depth0(self):
+        # two labelings: predict 0 or 1
+        base = self.lamN
+        # losses: lamN + errors
+        losses = np.array([base + self.n_pos, base + self.n_neg], dtype=np.int64)
+        self._bulk_add_losses(losses)
+
+    def _enumerate_depth1_fast(self):
+        lam = self.lamN
+        d_idx = self._active
+        posL = self.P1[d_idx]
+        negL = self.N1[d_idx]
+        posR = self.n_pos - posL
+        negR = self.n_neg - negL
+
+        # valid split: both branches non-empty
+        valid = (posL + negL > 0) & (posR + negR > 0)
+        if not np.any(valid):
+            return
+
+        posL = posL[valid]; negL = negL[valid]
+        posR = posR[valid]; negR = negR[valid]
+
+        # all 2x2 labelings in one go (4 combos)
+        base = 2 * lam
+        # broadcasting
+        losses = np.stack([
+            base + posL + posR,
+            base + posL + negR,
+            base + negL + posR,
+            base + negL + negR
+        ], axis=0).ravel()
+
+        self._bulk_add_losses(losses)
+
+    def _enumerate_depth2_fast(self):
+        lam = self.lamN
+        B = self.budget
+        d_idx = self._active
+        P1, N1, P2, N2 = self.P1, self.N1, self.P2, self.N2
+
+        posL_all = P1[d_idx]
+        negL_all = N1[d_idx]
+        posR_all = self.n_pos - posL_all
+        negR_all = self.n_neg - negL_all
+
+        # only split left twice (3 leaves) ----------
+        base3 = 3 * lam
+        for jf, f in enumerate(d_idx):
+            posL = posL_all[jf]; negL = negL_all[jf]
+            posR = posR_all[jf]; negR = negR_all[jf]
+
+            pos11_row = P2[f, d_idx]
+            neg11_row = N2[f, d_idx]
+            pos10_row = posL - pos11_row
+            neg10_row = negL - neg11_row
+
+            valid_h = (pos11_row + neg11_row > 0) & (pos10_row + neg10_row > 0) & (d_idx != f)
+            if not np.any(valid_h):
+                continue
+
+            pos11 = pos11_row[valid_h]; neg11 = neg11_row[valid_h]
+            pos10 = pos10_row[valid_h]; neg10 = neg10_row[valid_h]
+
+            # early prune whole block if min possible loss already too much by doing min over label choices: choose min error per leaf
+            min_block = base3 + np.minimum(pos11, neg11) + np.minimum(pos10, neg10) + min(posR, negR)
+            if np.all(min_block > B):
+                continue
+
+            # build the 2^3=8 labelings in vector form
+            e0_choices = np.array([posR, negR], dtype=np.int32)
+            left4 = np.stack([
+                pos11 + pos10,
+                pos11 + neg10,
+                neg11 + pos10,
+                neg11 + neg10
+            ], axis=0)
+            losses = (base3 + left4[:, None, :] + e0_choices[None, :, None]).reshape(-1)
+            self._bulk_add_losses(losses)
+
+        # split right twice (3 leaves)
+        for jf, f in enumerate(d_idx):
+            posL = posL_all[jf]; negL = negL_all[jf]
+            posR = posR_all[jf]; negR = negR_all[jf]
+
+            pos01_row = P1[d_idx] - P2[f, d_idx]
+            neg01_row = N1[d_idx] - N2[f, d_idx]
+            pos00_row = posR - pos01_row
+            neg00_row = negR - neg01_row
+
+            valid_g = (pos01_row + neg01_row > 0) & (pos00_row + neg00_row > 0) & (d_idx != f)
+            if not np.any(valid_g):
+                continue
+
+            pos01 = pos01_row[valid_g]; neg01 = neg01_row[valid_g]
+            pos00 = pos00_row[valid_g]; neg00 = neg00_row[valid_g]
+
+            min_block = base3 + np.minimum(pos01, neg01) + np.minimum(pos00, neg00) + min(posL, negL)
+            if np.all(min_block > B):
+                continue
+
+            e1_choices = np.array([posL, negL], dtype=np.int32)
+            right4 = np.stack([
+                pos01 + pos00,
+                pos01 + neg00,
+                neg01 + pos00,
+                neg01 + neg00
+            ], axis=0)
+            losses = (base3 + right4[:, None, :] + e1_choices[None, :, None]).reshape(-1)
+            self._bulk_add_losses(losses)
+
+        # split both twice (4 leaves)
+        base4 = 4 * lam
+        for jf, f in enumerate(d_idx):
+            posL = posL_all[jf]; negL = negL_all[jf]
+            posR = posR_all[jf]; negR = negR_all[jf]
+
+            pos11_row = P2[f, d_idx]
+            neg11_row = N2[f, d_idx]
+            pos10_row = posL - pos11_row
+            neg10_row = negL - neg11_row
+            valid_h = (pos11_row + neg11_row > 0) & (pos10_row + neg10_row > 0) & (d_idx != f)
+            if not np.any(valid_h):
+                continue
+            pos11 = pos11_row[valid_h]; neg11 = neg11_row[valid_h]
+            pos10 = pos10_row[valid_h]; neg10 = neg10_row[valid_h]
+            h4 = np.stack([
+                pos11 + pos10,
+                pos11 + neg10,
+                neg11 + pos10,
+                neg11 + neg10
+            ], axis=0)
+
+            pos01_row = P1[d_idx] - P2[f, d_idx]
+            neg01_row = N1[d_idx] - N2[f, d_idx]
+            pos00_row = posR - pos01_row
+            neg00_row = negR - neg01_row
+            valid_g = (pos01_row + neg01_row > 0) & (pos00_row + neg00_row > 0) & (d_idx != f)
+            if not np.any(valid_g):
+                continue
+            pos01 = pos01_row[valid_g]; neg01 = neg01_row[valid_g]
+            pos00 = pos00_row[valid_g]; neg00 = neg00_row[valid_g]
+            g4 = np.stack([
+                pos01 + pos00,
+                pos01 + neg00,
+                neg01 + pos00,
+                neg01 + neg00
+            ], axis=0)
+
+            # early optimal prune - min possible over (h,g)
+            min_h = np.minimum.reduce(h4) 
+            min_g = np.minimum.reduce(g4)
+            if (base4 + min_h.min() + min_g.min()) > B:
+                continue
+
+            # combine all 2^4=16 combos
+            for kh in range(4):
+                Hk = h4[kh][:, None]  # (H,1)
+                for kg in range(4):
+                    Gk = g4[kg][None, :]  # (1,G)
+                    sums = base4 + (Hk + Gk)  # (H,G)
+                    self._bulk_add_losses(sums.ravel())
