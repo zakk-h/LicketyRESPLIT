@@ -424,7 +424,7 @@ def tree_structure_signature(tree): # nested tuples can be hashed
 class SpecializedDepth2Node:
     __slots__ = ("budget", "depth", "lamN", "n_pos", "n_neg",
                  "P1", "N1", "P2", "N2",
-                 "objectives", "min_objective", "_active")
+                 "objectives", "min_objective", "_active", '_obj_by_depth', '_min_by_depth')
     def __init__(self, budget, depth, lamN, n_pos, n_neg, P1, N1, P2=None, N2=None, top_k_idx=None):
         assert depth in (1, 2)
         
@@ -443,6 +443,8 @@ class SpecializedDepth2Node:
         self.objectives = Counter()
         self.min_objective = float("inf")
 
+        self._obj_by_depth = {0: Counter(), 1: Counter(), 2: Counter()}
+        self._min_by_depth = {0: float("inf"), 1: float("inf"), 2: float("inf")}
 
         self._enumerate_depth0()
         if self.depth >= 1:
@@ -450,24 +452,37 @@ class SpecializedDepth2Node:
         if self.depth >= 2:
             self._enumerate_depth2_fast()
 
-    def _bulk_add_losses(self, losses: np.ndarray):
+        self.detach_stats()
+
+    def detach_stats(self):
+        self.P1 = None
+        self.N1 = None
+        self.P2 = None
+        self.N2 = None
+
+    def _bulk_add_losses(self, losses, level):
         if losses.size == 0:
             return
         losses = losses[losses <= self.budget]
         if losses.size == 0:
             return
+        # overall histogram and per-depth update    
         vals, cnts = np.unique(losses.astype(np.int64, copy=False), return_counts=True)
         self.objectives.update(dict(zip(vals.tolist(), cnts.tolist())))
         m = int(vals.min())
         if m < self.min_objective:
             self.min_objective = m
 
+        self._obj_by_depth[level].update(dict(zip(vals.tolist(), cnts.tolist())))
+        if m < self._min_by_depth[level]:
+            self._min_by_depth[level] = m
+
     def _enumerate_depth0(self):
         # two labelings: predict 0 or 1
         base = self.lamN
         # losses: lamN + errors
         losses = np.array([base + self.n_pos, base + self.n_neg], dtype=np.int64)
-        self._bulk_add_losses(losses)
+        self._bulk_add_losses(losses, level=0)
 
     def _enumerate_depth1_fast(self):
         lam = self.lamN
@@ -495,7 +510,7 @@ class SpecializedDepth2Node:
             base + negL + negR
         ], axis=0).ravel()
 
-        self._bulk_add_losses(losses)
+        self._bulk_add_losses(losses, level=1)
 
     def _enumerate_depth2_fast(self):
         lam = self.lamN
@@ -508,7 +523,7 @@ class SpecializedDepth2Node:
         posR_all = self.n_pos - posL_all
         negR_all = self.n_neg - negL_all
 
-        # only split left twice (3 leaves) ----------
+        # only split left twice (3 leaves)
         base3 = 3 * lam
         for jf, f in enumerate(d_idx):
             posL = posL_all[jf]; negL = negL_all[jf]
@@ -540,7 +555,7 @@ class SpecializedDepth2Node:
                 neg11 + neg10
             ], axis=0)
             losses = (base3 + left4[:, None, :] + e0_choices[None, :, None]).reshape(-1)
-            self._bulk_add_losses(losses)
+            self._bulk_add_losses(losses, level=2)
 
         # split right twice (3 leaves)
         for jf, f in enumerate(d_idx):
@@ -571,7 +586,7 @@ class SpecializedDepth2Node:
                 neg01 + neg00
             ], axis=0)
             losses = (base3 + right4[:, None, :] + e1_choices[None, :, None]).reshape(-1)
-            self._bulk_add_losses(losses)
+            self._bulk_add_losses(losses, level=2)
 
         # split both twice (4 leaves)
         base4 = 4 * lam
@@ -623,4 +638,70 @@ class SpecializedDepth2Node:
                 for kg in range(4):
                     Gk = g4[kg][None, :]  # (1,G)
                     sums = base4 + (Hk + Gk)  # (H,G)
-                    self._bulk_add_losses(sums.ravel())
+                    self._bulk_add_losses(sums.ravel(), level=2)
+
+    def truncated_copy(self, max_depth, budget = None):
+        budget = self.budget if budget is None else int(budget)
+
+        obj_by_depth_new = {0: Counter(), 1: Counter(), 2: Counter()}
+        min_by_depth_new = {0: float("inf"), 1: float("inf"), 2: float("inf")}
+        merged = Counter()
+        global_min = float("inf")
+
+        for lvl in range(max_depth + 1):
+            src = self._obj_by_depth[lvl]
+            if not src:
+                continue
+            # filter keys by budget
+            kept = {k: v for k, v in src.items() if k <= budget}
+            if kept:
+                obj_by_depth_new[lvl].update(kept)
+                lvl_min = min(kept.keys())
+                min_by_depth_new[lvl] = lvl_min
+                merged.update(kept)
+                if lvl_min < global_min:
+                    global_min = lvl_min
+
+        # construct a new instance without re-running __init__ enumeration
+        new = object.__new__(SpecializedDepth2Node)
+
+        new.budget = budget
+        new.depth = max_depth
+        new.lamN = self.lamN
+        new.n_pos = self.n_pos
+        new.n_neg = self.n_neg
+        new.P1 = self.P1
+        new.N1 = self.N1
+        new.P2 = self.P2
+        new.N2 = self.N2
+        new._active = self._active
+
+        new.objectives = merged
+        new.min_objective = global_min
+        new._obj_by_depth = obj_by_depth_new
+        new._min_by_depth = min_by_depth_new
+
+        return new
+    def is_empty(self):
+        return not self.objectives
+
+    def __bool__(self):
+        return not self.is_empty()
+
+    def count_trees(self):
+        return sum(self.objectives.values())
+
+    def count_trees_with_objective(self, target_obj):
+        return self.objectives.get(target_obj, 0)
+
+    def count_trees_within_objective(self, max_obj, min_obj=None, inclusive=True):
+        if min_obj is None:
+            if inclusive:
+                return sum(cnt for obj, cnt in self.objectives.items() if obj <= max_obj)
+            else:
+                return sum(cnt for obj, cnt in self.objectives.items() if obj < max_obj)
+        else:
+            if inclusive:
+                return sum(cnt for obj, cnt in self.objectives.items() if min_obj <= obj <= max_obj)
+            else:
+                return sum(cnt for obj, cnt in self.objectives.items() if min_obj < obj < max_obj)

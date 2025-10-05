@@ -39,3 +39,5 @@ Thumbs.db
 *.out
 /run_one_output_test/
 /slurm_jobs/
+
+plotting.ipynb

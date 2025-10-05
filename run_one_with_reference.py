@@ -286,6 +286,58 @@ def run_treefarms(X, y, reg, mult, depth):
     return dt, n_trees, label, model
 
 
+def count_true_rashomon_lickety(trie, true_bound_int: int) -> int:
+    return sum(cnt for obj, cnt in trie.objectives.items() if obj <= true_bound_int)
+
+def count_true_rashomon_resplit(model_resplit, X, y, true_bound_norm: float, reg: float) -> int:
+    cnt, _ = model_resplit.count_objectives_between(
+        X, y, low=0.0, high=true_bound_norm, reg=reg, return_list=True
+    )
+    return cnt
+
+def fit_lickety_best_objective(X, y, reg, depth,
+                               prune_style="H",
+                               trie_cache_strategy="compact",
+                               multiplicative_slack=0.0):
+    """
+    Runs LicketyRESPLIT with lookahead==depth and returns the best integer objective
+    in Lickety's native scale: errors + (λN)*leaves.
+    """
+    # Prepare boolean/uint8 data as Lickety expects
+    X_arr = X.to_numpy(copy=False) if hasattr(X, "to_numpy") else np.asarray(X)
+    y_arr = y.to_numpy(copy=False) if hasattr(y, "to_numpy") else np.asarray(y)
+    X_bool = np.asfortranarray(X_arr != 0)
+    y_uint8 = np.ascontiguousarray((y_arr != 0).astype(np.uint8, copy=False))
+
+    config = {
+        "regularization": reg,
+        "rashomon_bound_multiplier": 0.0,  # baseline search; bound not needed
+        "depth_budget": int(depth),
+    }
+    # Full lookahead == depth
+    model = LicketyRESPLIT(
+        config,
+        multipass=True,
+        lookahead=int(depth),
+        optimal=False,
+        pruning=True,
+        prune_style=prune_style,
+        consistent_lookahead=False,
+        better_than_greedy=False,
+        try_greedy_first=False,
+        multiplicative_slack=multiplicative_slack,
+        trie_cache_strategy=trie_cache_strategy,
+        cache_greedy=True,
+        cache_lickety=True,
+        cache_packbits=True,
+        cache_key_mode="bitvector",
+        stop_caching_at_depth=-1,
+        oracle_top_k=None
+    )
+    model.fit(X_bool, y_uint8)
+    print("Best:", model.best)
+    return int(model.best)  # Lickety's integer objective
+
 
 # -------------- main --------------
 def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_objective=False, better_than_greedy = False, lookahead_k = 1, prune_style = "H", consistent_lookahead=False, try_greedy_first=False, trie_cache_strategy = "compact", multiplicative_slack=0.00, cache_greedy=True, cache_lickety=True, cache_packbits=True, cache_key_mode="bitvector", stop_caching_at_depth=-1):
@@ -298,14 +350,8 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
         target = run_resplit
         kwargs = dict(X=X, y=y, reg=reg, mult=mult, depth=depth)
 
-    elif algo == "lickety":
-        best_obj = None
-        if use_gosdt_objective:
-            print("Computing GOSDT objective as baseline...")
-            best_obj = fit_gosdt_get_objective(X, y, reg=reg, depth_budget=depth)
-            #best_obj = 702
-            print(f"GOSDT objective: {best_obj:.6f}")
 
+    elif algo == "lickety":
         X_arr = X.to_numpy(copy=False) if hasattr(X, "to_numpy") else np.asarray(X)
         y_arr = y.to_numpy(copy=False) if hasattr(y, "to_numpy") else np.asarray(y)
         X_bool = np.asfortranarray(X_arr != 0)
@@ -313,7 +359,7 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
         del X, y, X_arr, y_arr
         gc.collect()
         target = run_lickety
-        kwargs = dict(X=X_bool, y=y_uint8, reg=reg, mult=mult, depth=depth, best_objective=best_obj, lookahead=lookahead_k, prune_style=prune_style, consistent_lookahead=consistent_lookahead, better_than_greedy=better_than_greedy, try_greedy_first=try_greedy_first, trie_cache_strategy = trie_cache_strategy, multiplicative_slack=multiplicative_slack, cache_greedy=cache_greedy, cache_lickety=cache_lickety, cache_packbits=cache_packbits, cache_key_mode=cache_key_mode, stop_caching_at_depth=stop_caching_at_depth)
+        kwargs = dict(X=X_bool, y=y_uint8, reg=reg, mult=mult, depth=depth, best_objective=None, lookahead=lookahead_k, prune_style=prune_style, consistent_lookahead=consistent_lookahead, better_than_greedy=better_than_greedy, try_greedy_first=try_greedy_first, trie_cache_strategy = trie_cache_strategy, multiplicative_slack=multiplicative_slack, cache_greedy=cache_greedy, cache_lickety=cache_lickety, cache_packbits=cache_packbits, cache_key_mode=cache_key_mode, stop_caching_at_depth=stop_caching_at_depth)
 
     elif algo == "treefarms":
         target = run_treefarms
@@ -333,6 +379,45 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
     )
     delta_mb = peak_mb - baseline_mb
     duration_s, n_trees, label, model = retval
+
+    true_rashomon_count = None
+    slack_counts = None  # will hold 5 integers
+
+    if algo in ("resplit", "lickety"):
+        # (Re)load normalized X,y for GOSDT
+        X_g, y_g = load_dataset(data_path)
+        # Lickety-as-baseline: full lookahead to get best integer objective
+        best_int = fit_lickety_best_objective(
+            X_g, y_g, reg=reg, depth=depth,
+            prune_style=prune_style,
+            trie_cache_strategy=trie_cache_strategy,
+            multiplicative_slack=multiplicative_slack
+        )
+
+        multipliers = [1.01, 1.02, 1.03, 1.04, 1.05, 1.1, 1.15, 1.2, 1.25, 1.5]
+
+        if algo == "lickety":
+            # Lickety uses integer objective natively
+            base_int = best_int
+            bound_int = int(round((1.0 + float(mult)) * base_int))
+            true_rashomon_count = count_true_rashomon_lickety(model.trie, bound_int)
+            slack_counts = [
+                count_true_rashomon_lickety(model.trie, int(round(s * bound_int)))
+                for s in multipliers
+            ]
+
+        elif algo == "resplit":
+            # RESPLIT uses normalized objective: divide Lickety's integer objective by N
+            N = len(y_g)
+            base_norm = float(best_int) / float(N)
+            bound_norm = (1.0 + float(mult)) * base_norm  # no rounding
+            true_rashomon_count = count_true_rashomon_resplit(model, X_g, y_g, bound_norm, reg=reg)
+            slack_counts = [
+                count_true_rashomon_resplit(model, X_g, y_g, s * bound_norm, reg=reg)
+                for s in multipliers
+            ]
+
+
 
     if False and algo == "lickety":
         trie = model.trie
@@ -368,15 +453,15 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
     print(f"delta_rss_mb        : {delta_mb:.1f}")
     print(f"num_trees          : {n_trees}")
 
-    return duration_s, peak_mb, delta_mb, n_trees
-
+    #return duration_s, peak_mb, delta_mb, n_trees
+    return duration_s, peak_mb, delta_mb, n_trees, true_rashomon_count, slack_counts
     
 
 if __name__ == "__main__":
     #main("bike_binarized_many.csv", "lickety", reg=0.01, depth=5, mult=0.01, lookahead_k=1, prune_style="H", consistent_lookahead=False, better_than_greedy=False, use_gosdt_objective=False, try_greedy_first=False, trie_cache_strategy = None, cache_greedy=False, cache_lickety=False, cache_packbits=False, cache_key_mode="bitvector", stop_caching_at_depth=0)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, default="compas_binarized.csv")
-    parser.add_argument("--algo", type=str, choices=["lickety", "resplit", "treefarms"], default="lickety")
+    parser.add_argument("--data", type=str, default="mushroom_binarized.csv")
+    parser.add_argument("--algo", type=str, choices=["lickety", "resplit", "treefarms"], default="resplit")
     parser.add_argument("--reg", type=float, default=0.005)
     parser.add_argument("--depth", type=int, default=5)
     parser.add_argument("--mult", type=float, default=0.03)
@@ -395,7 +480,7 @@ if __name__ == "__main__":
     parser.add_argument("--stop_caching_at_depth", type=int, default=0)
 
     args = parser.parse_args()
-    duration_s, peak_mb, delta_mb, n_trees = main(
+    duration_s, peak_mb, delta_mb, n_trees, true_count, slack_counts = main(
         data_path=args.data,
         algo=args.algo,
         reg=args.reg,
@@ -447,10 +532,17 @@ if __name__ == "__main__":
         f".csv"
     )
 
-    out_dir = Path("Outputs")
+    out_dir = Path("OutputsThroughput")
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / fname
 
+    multipliers = [1.01, 1.02, 1.03, 1.04, 1.05, 1.1, 1.15, 1.2, 1.25, 1.5]
+    slack_counts = slack_counts or [None] * len(multipliers)
+    slack_csv_fields = ",".join(f"count_{str(m).replace('.', 'p')}" for m in multipliers)
+    slack_csv_values = ",".join("" if v is None else str(v) for v in slack_counts)
+
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write("duration_s,peak_mb,delta_mb,num_trees\n")
-        f.write(f"{duration_s:.6f},{peak_mb:.2f},{delta_mb:.2f},{n_trees}\n")
+        f.write("duration_s,peak_mb,delta_mb,num_trees,true_rashomon_count," + slack_csv_fields + "\n")
+        f.write(f"{duration_s:.6f},{peak_mb:.2f},{delta_mb:.2f},{n_trees},"
+                f"{'' if true_count is None else true_count},"
+                f"{slack_csv_values}\n")

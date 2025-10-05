@@ -42,7 +42,7 @@ class LicketyRESPLIT:
             If True, uses ThresholdGuessBinarizer for binarization.
             If False, requires binary input data.
     '''
-    def __init__(self, config, binarize=False, lookahead=1, multipass=True, consistent_lookahead = False, prune_style = "H", gbdt_n_est=50, gbdt_max_depth=1, optimal=False, pruning=True, better_than_greedy=False, try_greedy_first=False, trie_cache_strategy="compact", multiplicative_slack=0, cache_greedy=True, cache_lickety=True, cache_key_mode="bitvector", cache_packbits=None, stop_caching_at_depth=-1, oracle_top_k=None):
+    def __init__(self, config, binarize=False, lookahead=1, multipass=True, consistent_lookahead = False, prune_style = "H", gbdt_n_est=50, gbdt_max_depth=1, optimal=False, pruning=True, better_than_greedy=False, try_greedy_first=False, trie_cache_strategy="compact", multiplicative_slack=0, cache_greedy=True, cache_lickety=True, cache_key_mode="bitvector", cache_packbits=None, stop_caching_at_depth=-1, oracle_top_k=None, cache_depth12_special=True):
         self.config = config
         self.domultipass = multipass
         self.lookahead = lookahead
@@ -84,6 +84,7 @@ class LicketyRESPLIT:
         self.use_shared_obj_cache = False
         self.lickety_greedy_shared_cache = {}
         self.oracle_top_k = oracle_top_k
+        self.cache_depth12_special = cache_depth12_special
         self._depth12_stats_cache = {}  # key -> {"n_pos","n_neg","P1","N1","P2","N2"}
 
     #@profile
@@ -250,15 +251,15 @@ class LicketyRESPLIT:
         # default: bitvector
         return self._key_bytes(bitvector)
 
-    def _compute_depth12_counts(self, bitvector, need_pairs=False):
-        key = self._cache_key(bitvector, None)
-        entry = self._depth12_stats_cache.get(key)
+    def _compute_depth12_counts(self, bitvector, need_pairs=False, remaining_depth=2):
+        do_cache = (self.cache_depth12_special) and (remaining_depth > self.stop_caching_at_depth)
+        key = self._cache_key(bitvector, None) if do_cache else None
+        entry = self._depth12_stats_cache.get(key) if do_cache else None
 
-        if entry is not None:
-            if need_pairs and (entry["P2"] is None or entry["N2"] is None):
-                # we need to recompute pairs; we will reuse singles already present
-                pass
-            else: # we have succificient information - either everything we need or we don't need pairs as we are depth 1
+        if do_cache and (entry is not None):
+            if need_pairs and (entry.get("P2") is None or entry.get("N2") is None):
+                pass  # upgrade pairs below
+            else:
                 return entry
 
         bv = np.asarray(bitvector, dtype=np.bool_)
@@ -277,19 +278,13 @@ class LicketyRESPLIT:
         Xn64 = X_sub[neg_mask].astype(np.int64, copy=False) if n_neg > 0 else np.zeros((0, d), dtype=np.int64)
 
         # we should load these if we have them
-        P1 = entry.get("P1") if entry and entry.get("P1") is not None else Xp64.sum(axis=0)
-        N1 = entry.get("N1") if entry and entry.get("N1") is not None else Xn64.sum(axis=0)
+        P1 = entry.get("P1") if (do_cache and entry and entry.get("P1") is not None) else Xp64.sum(axis=0)
+        N1 = entry.get("N1") if (do_cache and entry and entry.get("N1") is not None) else Xn64.sum(axis=0)
 
         P2 = N2 = None
         if need_pairs:
-            if n_pos > 0:
-                P2 = Xp64.T @ Xp64 # number of positive rows with feature i and feature j true in entry (i,j)
-            else:
-                P2 = np.zeros((d, d), dtype=np.int64)
-            if n_neg > 0:
-                N2 = Xn64.T @ Xn64
-            else:
-                N2 = np.zeros((d, d), dtype=np.int64)
+            P2 = (Xp64.T @ Xp64) if n_pos > 0 else np.zeros((d, d), dtype=np.int64)
+            N2 = (Xn64.T @ Xn64) if n_neg > 0 else np.zeros((d, d), dtype=np.int64)
 
         out = {
             "n_pos": n_pos,
@@ -299,25 +294,24 @@ class LicketyRESPLIT:
             "P2": P2,
             "N2": N2,
         }
+
+        if not do_cache: return out
         # save/upgrade cache
         if entry is None:
             self._depth12_stats_cache[key] = out
         else:
-            if entry.get("P2") is None:
-                entry["P2"] = out["P2"]
-            if entry.get("N2") is None:
-                entry["N2"] = out["N2"]
-            if entry.get("P1") is None:
-                entry["P1"] = P1
-            if entry.get("N1") is None:
-                entry["N1"] = N1
+            if entry.get("P1") is None: entry["P1"] = P1
+            if entry.get("N1") is None: entry["N1"] = N1
+            if need_pairs:
+                if entry.get("P2") is None: entry["P2"] = P2
+                if entry.get("N2") is None: entry["N2"] = N2
             self._depth12_stats_cache[key] = entry
 
         return out
 
     def specialized_trie_depth_2(self, bitvector, depth, budget):
         need_pairs = (depth == 2)
-        stats = self._compute_depth12_counts(bitvector, need_pairs=need_pairs)
+        stats = self._compute_depth12_counts(bitvector, need_pairs=need_pairs, remaining_depth=depth)
 
         n_pos = stats["n_pos"]
         n_neg = stats["n_neg"]
@@ -341,7 +335,7 @@ class LicketyRESPLIT:
 
     #@profile
     def construct_trie(self, bitvector, depth, budget, path_key=None):
-        if depth == 1 or depth == 2: return self.specialized_trie_depth_2(bitvector, depth, budget) # no more supporting path key
+        #if depth == 1 or depth == 2: return self.specialized_trie_depth_2(bitvector, depth, budget) # no more supporting path key
 
         if self.trie_cache_strategy and depth > self.stop_caching_at_depth:
             base_key = self._cache_key(bitvector, path_key) # bytes when "bitvector", frozenset when "literal"
