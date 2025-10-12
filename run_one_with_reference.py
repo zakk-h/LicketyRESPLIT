@@ -327,11 +327,11 @@ def fit_lickety_best_objective(X, y, reg, depth,
         try_greedy_first=False,
         multiplicative_slack=multiplicative_slack,
         trie_cache_strategy=trie_cache_strategy,
-        cache_greedy=True,
+        cache_greedy=False,
         cache_lickety=True,
         cache_packbits=True,
         cache_key_mode="bitvector",
-        stop_caching_at_depth=-1,
+        stop_caching_at_depth=2,
         oracle_top_k=None
     )
     model.fit(X_bool, y_uint8)
@@ -377,6 +377,7 @@ def main(data_path, algo="lickety", reg=0.01, depth=10, mult=0.01, use_gosdt_obj
         interval=0.01,
         include_children=True
     )
+    print("Done with main algorithm")
     delta_mb = peak_mb - baseline_mb
     duration_s, n_trees, label, model = retval
 

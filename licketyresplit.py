@@ -135,6 +135,9 @@ class LicketyRESPLIT:
                     best = int(round(best))
                 else:
                     best = int(round(best * self._n))
+            if mult==0: # lets just use this as an optimal decision tree algorithm, returning one optimal tree. can remove this but i want this functionality for experiments.
+                self.best = int(best)
+                return self
             # final Rashomon bound
             obj_bound = round(best * (1+mult)) # the objectives are round so we will also round here
             #obj_bound = math.ceil(best * (1 + mult)) # pretty arbituary, round may be more technically correct but expanding doesn't hurt - in practice things have just barely been outside that treefarms finds
