@@ -135,9 +135,7 @@ class LicketyRESPLIT:
                     best = int(round(best))
                 else:
                     best = int(round(best * self._n))
-            if mult==0: # lets just use this as an optimal decision tree algorithm, returning one optimal tree. can remove this but i want this functionality for experiments.
-                self.best = int(best)
-                return self
+            
             # final Rashomon bound
             obj_bound = round(best * (1+mult)) # the objectives are round so we will also round here
             #obj_bound = math.ceil(best * (1 + mult)) # pretty arbituary, round may be more technically correct but expanding doesn't hurt - in practice things have just barely been outside that treefarms finds
@@ -345,12 +343,12 @@ class LicketyRESPLIT:
         else: base_key = None  
 
         if self.trie_cache_strategy and depth > self.stop_caching_at_depth:
-            if self.trie_cache_strategy != "compact":
+            if self.trie_cache_strategy != "compact" and self.trie_cache_strategy != "superset":
                 key = (base_key, depth, budget)
                 hit = self.trie_cache.get(key)
                 if hit is not None:
                     return hit
-            else:
+            elif self.trie_cache_strategy == "compact":
                 entry = self.trie_cache.get(base_key)
                 if entry is not None:
                     (d_max, b_at_d, trieD), (d_at_b, b_max, trieB) = entry
@@ -359,34 +357,14 @@ class LicketyRESPLIT:
                         return trieD.truncated_copy(max_depth=depth, budget=budget)
                     if d_at_b >= depth and b_max >= budget:
                         return trieB.truncated_copy(max_depth=depth, budget=budget)
+            elif self.trie_cache_strategy == "superset":
+                entry = self.trie_cache.get(base_key)
+                if entry is not None:
+                    for (dd, bb, t) in entry:
+                        if dd >= depth and bb >= budget:
+                            return t.truncated_copy(max_depth=depth, budget=budget)
 
-            # optional superset probing (works with either key mode)
-            if self.trie_cache_strategy == "superset":
-                max_depth_cfg = int(self.config.get('depth_budget', depth))
-                max_budget_101 = int(math.ceil(budget * 1.01))
-                # same depth, bigger budget
-                if max_budget_101 > budget:
-                    for b2 in range(budget + 1, max_budget_101 + 1):
-                        k2 = (base_key, depth, b2)
-                        hit = self.trie_cache.get(k2)
-                        if hit is not None:
-                            return hit.truncated_copy(max_depth=depth, budget=budget)
-                # bigger depth, same budget
-                if max_depth_cfg > depth:
-                    for d2 in range(depth + 1, max_depth_cfg + 1):
-                        k2 = (base_key, d2, budget)
-                        hit = self.trie_cache.get(k2)
-                        if hit is not None:
-                            return hit.truncated_copy(max_depth=depth, budget=budget)
-                # bigger depth AND bigger budget band
-                if max_depth_cfg > depth and max_budget_101 > budget:
-                    for d2 in range(depth + 1, max_depth_cfg + 1):
-                        for b2 in range(budget + 1, max_budget_101 + 1):
-                            k2 = (base_key, d2, b2)
-                            hit = self.trie_cache.get(k2)
-                            if hit is not None:
-                                return hit.truncated_copy(max_depth=depth, budget=budget)
-
+           
         trie = TreeTrieNode(budget=budget)
         N  = self._n
         
@@ -458,9 +436,9 @@ class LicketyRESPLIT:
             trie.add_split(feat, left_trie, right_trie)
 
         if self.trie_cache_strategy is not None and depth > self.stop_caching_at_depth:
-            if self.trie_cache_strategy != "compact":
+            if self.trie_cache_strategy != "compact" and self.trie_cache_strategy != "superset":
                 self.trie_cache[(base_key, depth, budget)] = trie
-            else:
+            elif self.trie_cache_strategy == "compact":
                 old = self.trie_cache.get(base_key)
                 if old is None:
                     # initialize both slots with this trie; ok if identical
@@ -474,6 +452,14 @@ class LicketyRESPLIT:
                     if (budget > b_max) or (budget == b_max and depth > d_at_b):
                         d_at_b, b_max, trieB = depth, budget, trie
                     self.trie_cache[base_key] = ((d_max, b_at_d, trieD), (d_at_b, b_max, trieB))
+
+            elif self.trie_cache_strategy == "superset":
+                old = self.trie_cache.get(base_key)
+                if old is None:
+                    old = []
+                old.append((depth, budget, trie))
+                self.trie_cache[base_key] = old
+
 
         return trie
 
