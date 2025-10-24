@@ -8,8 +8,7 @@ from tqdm import tqdm
 from Tree import Node, Leaf
 from split import SPLIT, LicketySPLIT
 from split import ThresholdGuessBinarizer, GOSDTClassifier
-from Trie import TreeTrieNode, SplitNode, SpecializedDepth2Node
-import bisect
+from Trie import TreeTrieNode, SplitNode
 import math
 
 # TODO
@@ -84,8 +83,10 @@ class LicketyRESPLIT:
         self.use_shared_obj_cache = False
         self.lickety_greedy_shared_cache = {}
         self.oracle_top_k = oracle_top_k
-        self.cache_depth12_special = cache_depth12_special
-        self._depth12_stats_cache = {}  # key -> {"n_pos","n_neg","P1","N1","P2","N2"}
+        #self.cache_depth12_special = cache_depth12_special
+        #self._depth12_stats_cache = {}  # key -> {"n_pos","n_neg","P1","N1","P2","N2"}
+        #self._executor = None
+        #self._parallel_cutoff_depth = None
 
     #@profile
     def fit(self, X, y):
@@ -119,17 +120,24 @@ class LicketyRESPLIT:
         best = None
         t0 = time.time()
         if self.consistent_lookahead: self.lookahead_map = self._build_lookahead_map(depth)
-        root_path = None if self.cache_key_mode == "bitvector" else frozenset()
         if self.better_than_greedy:
-            greedy_root_obj = self.train_greedy(root_bitvector, depth, path_key=root_path)
+            greedy_root_obj = self.train_greedy(root_bitvector, depth)
             obj_bound = int(greedy_root_obj)      # we'll say better or equal to than greedy
             print(f"[better_than_greedy] greedy objective at root = {greedy_root_obj} ") 
         else:
             best = self.config.get('best_objective') # compute best_objective if not provided
             if best is None:
-                best = self.lickety_split(root_bitvector, depth, max(self.lookahead,1), path_key=root_path)  # use the lickety_split method to get the best objective, caches things, and does so faster
-                print(f"Best objective on root: {best:.6f} or {(best/self._n):.6f} and {time.time() - t0:.2f} seconds using lickety")
-                # best should be an integer now
+                #best = self.lickety_split(root_bitvector, depth, max(self.lookahead,1), path_key=root_path)  # use the lickety_split method to get the best objective, caches things, and does so faster
+                #print(f"Best objective on root: {best:.6f} or {(best/self._n):.6f} and {time.time() - t0:.2f} seconds using lickety")
+                if self.lookahead <= 0:
+                    best = self.train_greedy(root_bitvector, depth)
+                    print(f"Best objective on root (greedy): {best:d} "
+                        f"or {(best/self._n):.6f} and {time.time() - t0:.2f} seconds using greedy")
+                else:
+                    best = self.lickety_split(root_bitvector, depth, k=self.lookahead)
+                    print(f"Best objective on root: {best:d} "
+                        f"or {(best/self._n):.6f} and {time.time() - t0:.2f} seconds using lickety")
+                # best is an integer now
             else:
                 if best > 1:
                     best = int(round(best))
@@ -143,7 +151,24 @@ class LicketyRESPLIT:
         self.best = int(best) if best is not None else None
         self.obj_bound = int(obj_bound)
         
-        self.trie = self.construct_trie(root_bitvector, depth, int(round(obj_bound * (1 + self.multiplicative_slack))), path_key=root_path)
+        #self.trie = self.construct_trie(root_bitvector, depth, int(round(obj_bound * (1 + self.multiplicative_slack))), path_key=root_path)
+        # levels = max(0, int(math.log2(max(1, os.cpu_count() or 1))))
+
+        # if not self.domultipass and levels > 0:
+        #     self._parallel_cutoff_depth = depth - levels
+        #     with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
+        #         self._executor = pool
+        #         self.trie = self.construct_trie(
+        #             root_bitvector, depth,
+        #             int(round(obj_bound * (1 + self.multiplicative_slack))),
+        #             path_key=root_path
+        #         )
+        #     self._executor = None
+        #     self._parallel_cutoff_depth = None
+        # else:
+            # original call
+        self.trie = self.construct_trie(root_bitvector, depth, int(round(obj_bound * (1 + self.multiplicative_slack))))
+
         t1 = time.time()
         print(f"[LicketyRESPLIT] Finished in {t1 - t0:.3f} seconds with {self.trie.count_trees()} trees (truncated to {self.count_trees()})")
         return self
@@ -233,22 +258,18 @@ class LicketyRESPLIT:
                 self.lickety_greedy_shared_cache[key] = (tup[0], val)
         return
 
-    def _encode_lit(self, feat, val_bit): # doubling the feature index and maybe adding 1 or not, so mapping (feature, on/off) to an integer
-        return (int(feat) << 1) | (int(val_bit) & 1)
+    # def _encode_lit(self, feat, val_bit): # doubling the feature index and maybe adding 1 or not, so mapping (feature, on/off) to an integer
+    #     return (int(feat) << 1) | (int(val_bit) & 1)
 
-    def _path_add(self, path_key, feat, val_bit): # frozen-set is order invariant
-        lit = self._encode_lit(feat, val_bit)
-        if path_key is None:
-            return frozenset((lit,))
-        return frozenset((*path_key, lit))
+    # def _path_add(self, path_key, feat, val_bit): # frozen-set is order invariant
+    #     lit = self._encode_lit(feat, val_bit)
+    #     if path_key is None:
+    #         return frozenset((lit,))
+    #     return frozenset((*path_key, lit))
 
-    def _cache_key(self, bitvector, path_key):
-        """
-        - 'bitvector': canonical packed-bytes (interned)
-        - 'literal'  : order-invariant frozenset of encoded literals
-        """
-        if self.cache_key_mode == "literal":
-            return path_key if path_key is not None else frozenset()
+    def _cache_key(self, bitvector):
+        # if self.cache_key_mode == "literal":
+        #     return path_key if path_key is not None else frozenset()
         # default: bitvector
         return self._key_bytes(bitvector)
 
@@ -335,11 +356,11 @@ class LicketyRESPLIT:
         return node
 
     #@profile
-    def construct_trie(self, bitvector, depth, budget, path_key=None):
+    def construct_trie(self, bitvector, depth, budget):
         #if depth == 1 or depth == 2: return self.specialized_trie_depth_2(bitvector, depth, budget) # no more supporting path key
 
         if self.trie_cache_strategy and depth > self.stop_caching_at_depth:
-            base_key = self._cache_key(bitvector, path_key) # bytes when "bitvector", frozenset when "literal"
+            base_key = self._cache_key(bitvector) # bytes when "bitvector", frozenset when "literal"
         else: base_key = None  
 
         if self.trie_cache_strategy and depth > self.stop_caching_at_depth:
@@ -399,28 +420,28 @@ class LicketyRESPLIT:
             right_bitvector = bitvector & ~bf
             if not left_bitvector.any() or not right_bitvector.any():
                 continue
-            if self.cache_key_mode == "literal":
-                left_path_key  = self._path_add(path_key, feat, 1)
-                right_path_key = self._path_add(path_key, feat, 0)
-            else:
-                left_path_key = right_path_key = None
+            # if self.cache_key_mode == "literal":
+            #     left_path_key  = self._path_add(path_key, feat, 1)
+            #     right_path_key = self._path_add(path_key, feat, 0)
+            # else:
+            #     left_path_key = right_path_key = None
 
             # only explore things where some oracle would get within the set. maybe this means we should add some slack to the initial call and then trim after
             # it may be worth it to try greedy, and if it it within the set, you don't need to ask a more expensive oracle.
             if self.try_greedy_first:
-                loss_l  = self.train_greedy(left_bitvector,  depth - 1, path_key=left_path_key)
-                loss_r = self.train_greedy(right_bitvector, depth - 1, path_key=right_path_key)
+                loss_l  = self.train_greedy(left_bitvector,  depth - 1)
+                loss_r = self.train_greedy(right_bitvector, depth - 1)
             if (not self.try_greedy_first) or loss_l + loss_r > budget: # if greedy is bad, we need to try the other methods, but otherwise don't.
                 if self.optimal:
                     loss_l = self.objective_optimal(left_bitvector,  depth - 1)
                     loss_r = self.objective_optimal(right_bitvector, depth - 1)
                 else:
                     if self.lookahead <= 0:
-                        loss_l = self.train_greedy(left_bitvector,  depth - 1, path_key=left_path_key)
-                        loss_r = self.train_greedy(right_bitvector, depth - 1, path_key=right_path_key)
+                        loss_l = self.train_greedy(left_bitvector,  depth - 1)
+                        loss_r = self.train_greedy(right_bitvector, depth - 1)
                     else:
-                        loss_l = self.lickety_split(left_bitvector,  depth - 1, k=self.lookahead, path_key=left_path_key)
-                        loss_r = self.lickety_split(right_bitvector, depth - 1, k=self.lookahead, path_key=right_path_key)
+                        loss_l = self.lickety_split(left_bitvector,  depth - 1, k=self.lookahead)
+                        loss_r = self.lickety_split(right_bitvector, depth - 1, k=self.lookahead)
 
             # pruning should always always be on
             if self.pruning and loss_l + loss_r > budget: # if greedy isn't within budget (which starts out epsilon loose), then we can skip this feature. greedy pruning to approxmation r-set
@@ -430,7 +451,6 @@ class LicketyRESPLIT:
                 loss_l, loss_r,
                 left_bitvector, right_bitvector,
                 budget, depth,
-                left_path_key=left_path_key, right_path_key=right_path_key
             )
         
             trie.add_split(feat, left_trie, right_trie)
@@ -464,33 +484,55 @@ class LicketyRESPLIT:
         return trie
 
     #@profile
-    def multipass(self, loss_l, loss_r, left_bitvector, right_bitvector, budget, depth, left_path_key=None, right_path_key=None):
-        overly_tight_right_expense = loss_r # overly tight, will only find a subset of what we want
-        left_subset_budget = budget - overly_tight_right_expense # too restrictive, but will find a subset of what we want (careful that empty doesn't mean anything, but this is somewhat just heuristics to see how to cut down search space)
-      
-        # enumerate left subtree set
-        left_subtrie = self.construct_trie(left_bitvector, depth-1, left_subset_budget, path_key=left_path_key) # a subset of what we want 
-    
-        # compute max right budget
-        min_left = left_subtrie.min_objective # the smaller the left objective, the more we can spend on the right.
-        right_budget = budget - min_left
+    def multipass(self, loss_l, loss_r, left_bitvector, right_bitvector, budget, depth):
+        if self.domultipass:    
+            overly_tight_right_expense = loss_r # overly tight, will only find a subset of what we want
+            left_subset_budget = budget - overly_tight_right_expense # too restrictive, but will find a subset of what we want (careful that empty doesn't mean anything, but this is somewhat just heuristics to see how to cut down search space)
         
-        # enumerate right subtree set
-        right_trie = self.construct_trie(right_bitvector, depth-1, right_budget, path_key=right_path_key)
-
-        min_right = right_trie.min_objective # assuming there was a tree, this should be the best possible tree that one can get
-        left_budget = budget - min_right # nowe we have a not overly tight budget for the left side, so we can enumerate it correctly
-
-        if left_budget > left_subset_budget: # TODO: CAN SHARE INFORMATION BETWEEN SUBTRIE AND TRIE, BUT THIS HARDLY EVER RUNS SO DOESN'T MATTER MUCH
-            left_trie = self.construct_trie(left_bitvector, depth-1, left_budget, path_key=left_path_key) # a subset of what we want
-        else: 
-            left_trie = left_subtrie # budgets were equal, will just return the same thing
-            #print("LEFT SUBSET = LEFT SET") # this happens a lot and saves time
-        #left_set = left_subset # just to see if this is faster. indeed it is by a little bit
+            # enumerate left subtree set
+            left_subtrie = self.construct_trie(left_bitvector, depth-1, left_subset_budget) # a subset of what we want 
         
+            # compute max right budget
+            min_left = left_subtrie.min_objective # the smaller the left objective, the more we can spend on the right.
+            right_budget = budget - min_left
+            
+            # enumerate right subtree set
+            right_trie = self.construct_trie(right_bitvector, depth-1, right_budget)
+
+            min_right = right_trie.min_objective # assuming there was a tree, this should be the best possible tree that one can get
+            left_budget = budget - min_right # nowe we have a not overly tight budget for the left side, so we can enumerate it correctly
+
+            if left_budget > left_subset_budget: # TODO: CAN SHARE INFORMATION BETWEEN SUBTRIE AND TRIE, BUT THIS HARDLY EVER RUNS SO DOESN'T MATTER MUCH
+                left_trie = self.construct_trie(left_bitvector, depth-1, left_budget) # a subset of what we want
+            else: 
+                left_trie = left_subtrie # budgets were equal, will just return the same thing
+                #print("LEFT SUBSET = LEFT SET") # this happens a lot and saves time
+            #left_set = left_subset # just to see if this is faster. indeed it is by a little bit
+        else:
+            # parallel-at-top-only; sequential below cutoff
+            overly_tight_right_expense = loss_r
+            left_subset_budget = budget - overly_tight_right_expense
+            overly_tight_left_expense = loss_l
+            right_subset_budget = budget - overly_tight_left_expense
+
+            def build_left():
+                return self.construct_trie(left_bitvector, depth-1, left_subset_budget)
+            def build_right():
+                return self.construct_trie(right_bitvector, depth-1, right_subset_budget)
+
+            # # use the shared pool if we are above cutoff
+            # if depth > self._parallel_cutoff_depth:
+            #     f_left = self._executor.submit(build_left)
+            #     f_right = self._executor.submit(build_right)
+            #     left_trie  = f_left.result()
+            #     right_trie = f_right.result()
+            # else: # sequential (or can switch back to multipass)
+            left_trie  = build_left()
+            right_trie = build_right()
+
         return left_trie, right_trie
 
-    def _build_lookahead_map(self, max_depth: int):
+    def _build_lookahead_map(self, max_depth):
         # build a depth->k map using a cycling pattern from depth=max_depth down to 0 (goal: help in caching)
         K = int(self.lookahead)
         if K <= 1 or max_depth <= 0:
@@ -515,12 +557,12 @@ class LicketyRESPLIT:
         raise ValueError("prune_style must be 'Z' or 'H'")
 
     #@profile
-    def train_greedy(self, bitvector, depth_budget, path_key=None):
+    def train_greedy(self, bitvector, depth_budget):
         N = self._n
         reg = self.lamN # scaled integer
         do_cache_g = self.cache_greedy and (depth_budget > self.stop_caching_at_depth)
         if do_cache_g:
-            key_base = self._cache_key(bitvector, path_key)
+            key_base = self._cache_key(bitvector)
             key = (key_base, depth_budget)
             cached = self._greedy_cache_get(key)
             if cached is not None:
@@ -558,16 +600,16 @@ class LicketyRESPLIT:
         # right_bitvector = bitvector & ~bf
         left_bitvector = bitvector & bf
         right_bitvector = bitvector & ~bf
-        if self.cache_key_mode == "literal":
-            left_path  = self._path_add(path_key, best_feature, 1)
-            right_path = self._path_add(path_key, best_feature, 0)
-        else:
-            left_path = right_path = None
+        # if self.cache_key_mode == "literal":
+        #     left_path  = self._path_add(path_key, best_feature, 1)
+        #     right_path = self._path_add(path_key, best_feature, 0)
+        # else:
+        #     left_path = right_path = None
 
 
         if left_bitvector.any() and right_bitvector.any():
-            left_loss = self.train_greedy(left_bitvector, depth_budget-1, path_key=left_path) # no rescaling needed given global dataset size normalization
-            right_loss = self.train_greedy(right_bitvector, depth_budget-1, path_key=right_path)
+            left_loss = self.train_greedy(left_bitvector, depth_budget-1) # no rescaling needed given global dataset size normalization
+            right_loss = self.train_greedy(right_bitvector, depth_budget-1)
                 
             if left_loss + right_loss < loss: # only split if it improves the loss
                 loss = left_loss + right_loss
@@ -584,10 +626,10 @@ class LicketyRESPLIT:
         return range(min(self.oracle_top_k, d))
 
     #@profile
-    def lickety_split(self, bitvector, depth_budget, k=1, path_key=None):
+    def lickety_split(self, bitvector, depth_budget, k=1):
         do_cache_l = self.cache_lickety and (depth_budget > self.stop_caching_at_depth)
         if do_cache_l:
-            key_base = self._cache_key(bitvector, path_key)
+            key_base = self._cache_key(bitvector)
             if self.consistent_lookahead and self.lookahead_map is not None:
                 k = self.lookahead_map.get(depth_budget, k)
                 key = (key_base, int(depth_budget))
@@ -600,7 +642,7 @@ class LicketyRESPLIT:
                 return cached
             
         if depth_budget <= 0: # adopt leaf logic
-            a = self.train_greedy(bitvector, 0, path_key=path_key)
+            a = self.train_greedy(bitvector, 0)
             #self._lickety_cache_set(key, a) # just recompute, not expensive, especially because greedy will be cached
             return a
 
@@ -628,19 +670,19 @@ class LicketyRESPLIT:
             if not left.any() or not right.any():
                 continue
             
-            if self.cache_key_mode == "literal":
-                left_path  = self._path_add(path_key, feat, 1)
-                right_path = self._path_add(path_key, feat, 0)
-            else:
-                left_path = right_path = None
+            # if self.cache_key_mode == "literal":
+            #     left_path  = self._path_add(path_key, feat, 1)
+            #     right_path = self._path_add(path_key, feat, 0)
+            # else:
+            #     left_path = right_path = None
 
 
             if k>1: # consider k=2. we want to choose the next split based on the best split that follows given greedy after.
-                loss_l = self.lickety_split(left,  depth_budget - 1, k-1, path_key=left_path)
-                loss_r = self.lickety_split(right, depth_budget - 1, k-1, path_key=right_path)
+                loss_l = self.lickety_split(left,  depth_budget - 1, k-1)
+                loss_r = self.lickety_split(right, depth_budget - 1, k-1)
             else: # k=1 lookahead is standard licketysplit, which chooses the best split based on greedy
-                loss_l = self.train_greedy(left,  depth_budget - 1, path_key=left_path)
-                loss_r = self.train_greedy(right, depth_budget - 1, path_key=right_path)
+                loss_l = self.train_greedy(left,  depth_budget - 1)
+                loss_r = self.train_greedy(right, depth_budget - 1)
             total = loss_l + loss_r
 
             if total < best_loss:
@@ -661,8 +703,8 @@ class LicketyRESPLIT:
         # if lookahead=0, child_k becomes 1 because we want to keep doing standard lickety split (only used in root objective calculation initially).
         
    
-        left_loss  = self.lickety_split(best_lr[0], depth_budget - 1, child_k, path_key=self._path_add(path_key, best_feat, 1))
-        right_loss = self.lickety_split(best_lr[1], depth_budget - 1, child_k, path_key=self._path_add(path_key, best_feat, 0))
+        left_loss  = self.lickety_split(best_lr[0], depth_budget - 1, child_k)
+        right_loss = self.lickety_split(best_lr[1], depth_budget - 1, child_k)
         lickety_loss = left_loss + right_loss
 
         #node = Node(feature=best_feat, left_child=left_node, right_child=right_node)
