@@ -117,6 +117,23 @@ struct K3 {
     };
 };
 
+struct KLA {
+    uint64_t k;
+    int depth;
+    int la; // lookahead used for this call
+    bool operator==(const KLA& o) const { return k == o.k && depth == o.depth && la == o.la; }
+    struct Hash {
+        size_t operator()(const KLA& x) const noexcept {
+            size_t h = (size_t)x.k;
+            size_t d = (size_t)x.depth;
+            size_t a = (size_t)x.la;
+            h ^= d + 0x9e3779b97f4a7c15ULL + (h<<6) + (h>>2);
+            h ^= a + 0x9e3779b97f4a7c15ULL + (h<<6) + (h>>2);
+            return h;
+        }
+    };
+};
+
 struct HistEntry {
     int obj;
     uint64_t cnt;
@@ -148,6 +165,16 @@ struct TreeTrieNode {
         uint64_t s = 0;
         for (const auto& e : hist) s += e.cnt;
         return s;
+    }
+
+    uint64_t count_leq(int objective) const {
+        if (hist.empty()) return 0ULL;
+        uint64_t total = 0ULL;
+        for (const auto& e : hist) {
+            if (e.obj > objective) break; // hist is sorted ascending by obj
+            total += e.cnt;
+        }
+        return total;
     }
 
     void add_hist(int obj, uint64_t add_cnt = 1) {
@@ -239,6 +266,8 @@ private:
     int best_objective = 0;
     int obj_bound = 0;
 
+    double multiplicative_slack = 0.0;
+
     vector<Packed> X_bits; // vector of Packed, each Packed is a feature column. packed is a sequence of 64-bit words where each bit corresponds to the row value for the column
     Packed Ypos; // each bit of a word is the label for the row
 
@@ -246,8 +275,12 @@ private:
     bool trie_cache_enabled = true;
     MaskIdTable mask_ids; // used only if in exact mode
 
+    int lookahead_init = 1;
+
     unordered_map<K2, int, K2::Hash> greedy_cache;
-    unordered_map<K2, int, K2::Hash> lickety_cache;
+    unordered_map<K2,  int, K2::Hash>  lickety_cache_k2; // used when lookahead_init <= 1
+    unordered_map<KLA, int, KLA::Hash>  lickety_cache_kla; // used when lookahead_init > 1
+
     unordered_map<K3, shared_ptr<TreeTrieNode>, K3::Hash> trie_cache; // if trie_cache_enabled is on
 
     // bitwise and of the bitvectors represented as lists of words. makes a sparser list of words
@@ -277,6 +310,8 @@ private:
         }
     }
 
+    inline bool use_kla_cache() const { return lookahead_init > 1; }
+    
     inline int count_total(const Packed& mask) const { return mask.count(); } // number of active samples
     inline int count_pos(const Packed& mask) const { return popcount_and(mask, Ypos); } // number of active samples that are positive
 
@@ -285,20 +320,23 @@ private:
         p = max(eps, min(1.0 - eps, p));
         return -(p * log2(p) + (1.0 - p) * log2(1.0 - p));
     }
+    
 
 public:
     shared_ptr<TreeTrieNode> result;
 
     void set_key_mode(KeyMode m) { key_mode = m; }
     void set_trie_cache_enabled(bool on) { trie_cache_enabled = on; }
+    void set_multiplicative_slack(double s) { multiplicative_slack = s; }
 
     void fit(const vector<vector<bool>>& X_col_major, const vector<int>& y,
-             double lambda, int depth_budget, double rashomon_mult) {
+             double lambda, int depth_budget, double rashomon_mult, int lookahead_k) {
         n_features = (int)X_col_major.size();
         n_samples  = (int)X_col_major[0].size();
         n_words = (n_samples + 63) / 64; // 64 -> 1, 65 -> 2
         tail_mask = (n_samples % 64) ? ((1ULL << (n_samples % 64)) - 1ULL) : ~0ULL; // if multiple of 64, all 1s. otherwise, n_samples % 64 1s followed by 0s.
         lamN = (int)llround(lambda * (double)n_samples);
+        lookahead_init = lookahead_k;
 
         X_bits.assign(n_features, Packed(n_words)); // length n_features with entries of Packed, initialized to all 0s bits, we will set below.
         for (int f = 0; f < n_features; ++f) {
@@ -319,11 +357,16 @@ public:
         for (int i = 0; i < n_words-1; ++i) root.w[i] = ~0ULL; // not 0, so all 1.
         root.w[n_words-1] = tail_mask; // enforce 0s for out of scope
 
-        best_objective = lickety_split(root, depth_budget);
+        if (lookahead_init <= 0) {
+        best_objective = train_greedy(root, depth_budget);
+        } else {
+            best_objective = lickety_split(root, depth_budget, lookahead_init);
+        }
         cout << "Best objective: " << best_objective
              << " (" << (double)best_objective / (double)n_samples << ")\n";
 
-        obj_bound = (int)llround((double)best_objective * (1.0 + rashomon_mult));
+        obj_bound = (int)llround(best_objective * (1.0 + rashomon_mult) * (1.0 + multiplicative_slack));
+
         cout << "Objective bound: " << obj_bound << "\n";
 
         result = construct_trie(root, depth_budget, obj_bound);
@@ -331,8 +374,8 @@ public:
         cout << "Found " << result->count_trees() << " trees\n";
         cout << "Minimum objective: " << result->min_objective << "\n";
         cout << "Cache sizes - Greedy: " << greedy_cache.size()
-             << ", Lickety: " << lickety_cache.size()
-             << ", Trie: " << trie_cache.size();
+            << ", Lickety: " << (use_kla ? lickety_cache_kla.size() : lickety_cache_k2.size())
+            << ", Trie: " << trie_cache.size();
         if (key_mode == KeyMode::EXACT) {
             cout << ", Unique masks: " << mask_ids.size();
         }
@@ -384,8 +427,12 @@ private:
 
             if (!L.any() || !R.any()) continue;
 
-            int lossL = lickety_split(L, depth - 1);
-            int lossR = lickety_split(R, depth - 1);
+            const int lossL = (lookahead_init <= 0)
+                        ? train_greedy(L, depth - 1)
+                        : lickety_split(L, depth - 1, lookahead_init);
+            const int lossR = (lookahead_init <= 0)
+                        ? train_greedy(R, depth - 1)
+                        : lickety_split(R, depth - 1, lookahead_init);
             if (lossL + lossR > budget) continue;
 
             auto LR = multipass_long(lossL, lossR, L, R, budget, depth); // while loop until converges
@@ -488,11 +535,24 @@ private:
         return ans;
     }
 
-    // hardcoded k=1 lookahead
-    int lickety_split(const Packed& mask, int depth_budget) {
-        const uint64_t k = key_of_mask(mask);
-        K2 key{k, depth_budget};
-        if (auto it = lickety_cache.find(key); it != lickety_cache.end()) return it->second;
+    int eval_with_lookahead(const Packed& m, int depth, int k) {
+            if (k <= 0) return train_greedy(m, depth);
+            return lickety_split(m, depth, k);
+    }
+
+    int lickety_split(const Packed& mask, int depth_budget, int k) {
+        const uint64_t kmask = key_of_mask(mask);
+        const bool use_kla = use_kla_cache();
+        K2  key2{kmask, depth_budget}; // two keys but only 1 will be used
+        KLA keyla{kmask, depth_budget, k};
+
+        if (use_kla) {
+            if (auto it = lickety_cache_kla.find(keyla); it != lickety_cache_kla.end())
+                return it->second;
+        } else {
+            if (auto it = lickety_cache_k2.find(key2); it != lickety_cache_k2.end())
+                return it->second;
+        }
 
         if (depth_budget <= 0) {
             int v = train_greedy(mask, 0);
@@ -503,7 +563,8 @@ private:
         const int pos   = count_pos(mask);
         const int leaf_loss = lamN + min(pos, n_sub - pos);
         if (leaf_loss <= 2 * lamN) {
-            lickety_cache.emplace(key, leaf_loss);
+            if (use_kla) lickety_cache_kla.emplace(keyla, leaf_loss);
+            else lickety_cache_k2.emplace(key2,  leaf_loss);
             return leaf_loss;
         }
 
@@ -512,12 +573,14 @@ private:
 
         Packed L(n_words), R(n_words), bestL(n_words), bestR(n_words);
 
+        const int child_k = k - 1;
         for (int f = 0; f < n_features; ++f) {
             and_bits(mask, X_bits[f], L);
             andnot_bits(mask, X_bits[f], R);
             if (!L.any() || !R.any()) continue;
 
-            int sum = train_greedy(L, depth_budget - 1) + train_greedy(R, depth_budget - 1);
+            //int sum = train_greedy(L, depth_budget - 1) + train_greedy(R, depth_budget - 1);
+            const int sum = eval_with_lookahead(L, depth_budget - 1, child_k) + eval_with_lookahead(R, depth_budget - 1, child_k);
             if (sum < best_sum) {
                 best_sum = sum;
                 best_feat = f;
@@ -536,11 +599,12 @@ private:
         // }
         int ans = leaf_loss; 
         if (best_feat >= 0) {
-            int left_loss  = lickety_split(bestL, depth_budget - 1);
-            int right_loss = lickety_split(bestR, depth_budget - 1);
+            const int left_loss  = lickety_split(bestL, depth_budget - 1, k);
+            const int right_loss = lickety_split(bestR, depth_budget - 1, k);
             ans = min(ans, left_loss + right_loss); // do lickety even if leaf is better over greedy and see which is preferred
         }
-        lickety_cache.emplace(key, ans);
+        if (use_kla) lickety_cache_kla.emplace(keyla, ans);
+        else lickety_cache_k2.emplace(key2,  ans);
         return ans;
     }
 
@@ -592,8 +656,10 @@ extern "C" {
                       const uint8_t* X_data, int n_samples, int n_features,
                       const int* y_data,
                       double lambda, int depth, double rashomon_mult,
-                      int key_mode /*0=hash,1=exact*/,
-                      int trie_cache_enabled /*0=off, 1=on*/) {
+                      double multiplicative_slack,
+                      int key_mode,
+                      int trie_cache_enabled,
+                      int lookahead_k) {
         vector<vector<bool>> X(n_features, vector<bool>(n_samples));
         for (int f = 0; f < n_features; ++f) {
             const uint8_t* col = X_data + (size_t)f * (size_t)n_samples;
@@ -603,11 +669,17 @@ extern "C" {
         if (key_mode == 1) model->set_key_mode(LicketyRESPLIT::KeyMode::EXACT);
         else               model->set_key_mode(LicketyRESPLIT::KeyMode::HASH64);
         model->set_trie_cache_enabled(trie_cache_enabled != 0);
-        model->fit(X, y, lambda, depth, rashomon_mult);
+        model->set_multiplicative_slack(multiplicative_slack);
+        model->fit(X, y, lambda, depth, rashomon_mult, lookahead_k);
     }
 
     uint64_t get_tree_count(LicketyRESPLIT* model) {
         return model->result ? model->result->count_trees() : 0ULL;
+    }
+
+    uint64_t count_trees_leq(LicketyRESPLIT* model, int objective) {
+        if (!model || !model->result) return 0ULL;
+        return model->result->count_leq(objective);
     }
 
     int get_min_objective(LicketyRESPLIT* model) {
