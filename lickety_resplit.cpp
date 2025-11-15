@@ -160,14 +160,17 @@ struct TreeTrieNode {
     vector<LeafNode> leaves; // (prediction,loss) for as many [<=2 in binary classification] if within budget
     vector<SplitNode> splits; // stores splitnodes which have the feature they split on and left and right trienodes
     vector<HistEntry> hist; // sorted ascending by obj; counts aggregated (obj, count) are elements
+    bool hist_built = false; // wait until the end to build the histograms because we don't know if they'll be used in the final trie because of multipass
 
     uint64_t count_trees() const {
+        ensure_hist_built();
         uint64_t s = 0;
         for (const auto& e : hist) s += e.cnt;
         return s;
     }
 
     uint64_t count_leq(int objective) const {
+        ensure_hist_built();
         if (hist.empty()) return 0ULL;
         uint64_t total = 0ULL;
         for (const auto& e : hist) {
@@ -183,13 +186,37 @@ struct TreeTrieNode {
         else hist.insert(it, HistEntry{obj, add_cnt}); // otherwise, add
         if (obj < min_objective) min_objective = obj; // keep min_objective fresh
     }
-
-    void add_leaf(int prediction, int loss) { // assumes you call within budget
+    
+    void add_leaf(int prediction, int loss) {
+        leaves.push_back(LeafNode{prediction, loss});
+        if (loss < min_objective) min_objective = loss;
+    }
+    
+    void add_leaf_and_build(int prediction, int loss) { // assumes you call within budget
         leaves.push_back(LeafNode{prediction, loss});
         add_hist(loss, 1);
     }
 
     void add_split(int feat,
+               const shared_ptr<TreeTrieNode>& L,
+               const shared_ptr<TreeTrieNode>& R) {
+        SplitNode s;
+        s.feature = feat;
+        s.left  = L;
+        s.right = R;
+        s.num_valid_trees = 0; // will be filled in post-processing
+
+        if (L && R) {
+            int min_sum = (L->min_objective == numeric_limits<int>::max() ||
+                        R->min_objective == numeric_limits<int>::max())
+                        ? numeric_limits<int>::max()
+                        : (L->min_objective + R->min_objective);
+            if (min_sum < min_objective) min_objective = min_sum;
+        }
+        splits.push_back(std::move(s));
+    }
+
+    void add_split_and_build(int feat,
                    const shared_ptr<TreeTrieNode>& L,
                    const shared_ptr<TreeTrieNode>& R) {
         SplitNode s;
@@ -250,6 +277,46 @@ struct TreeTrieNode {
 
         splits.push_back(std::move(s)); // adding this split information to the trienode
     }
+
+    // post-process the trie to build per-node histograms using the existing helpers.
+    // assumes leaves/splits/min_objective/budget are already set by construct_trie.
+    static void build_histograms_post(TreeTrieNode* node) {
+        if (!node || node->hist_built) return;
+
+        //nsur ee children are processed first (post-order)
+        for (auto &s : node->splits) {
+            if (s.left)  build_histograms_post(s.left.get());
+            if (s.right) build_histograms_post(s.right.get());
+        }
+
+        // rebuild this node's histogram from scratch
+        std::vector<SplitNode> saved = std::move(node->splits);
+        node->splits.clear();
+        node->hist.clear();
+        node->hist_built = false; // (will set true at end)
+
+        // add leaf contributions
+        for (const auto &leaf : node->leaves) {
+            node->add_hist(leaf.loss, 1); // could call add_leaf_and_build but that is overkill here
+        }
+
+        // re-add splits, letting add_split_and_build do the heavy lifting:
+        // merges L/R histograms into node->hist
+        // computes s.num_valid_trees
+        // refreshes min_objective though that isn't needed
+        for (auto &s : saved) {
+            node->add_split_and_build(s.feature, s.left, s.right);
+        }
+
+        node->hist_built = true;
+    }
+
+    void ensure_hist_built() const {
+        if (!hist_built) {
+            TreeTrieNode::build_histograms_post(const_cast<TreeTrieNode*>(this));
+        }
+    }
+
 };
 
 class LicketyRESPLIT {
@@ -275,7 +342,7 @@ private:
     bool trie_cache_enabled = true;
     MaskIdTable mask_ids; // used only if in exact mode
 
-    int lookahead_init = 1;
+    int lookahead_init = 1; // to change 
 
     unordered_map<K2, int, K2::Hash> greedy_cache;
     unordered_map<K2,  int, K2::Hash>  lickety_cache_k2; // used when lookahead_init <= 1
@@ -371,10 +438,10 @@ public:
 
         result = construct_trie(root, depth_budget, obj_bound);
 
-        cout << "Found " << result->count_trees() << " trees\n";
+        // cout << "Found " << result->count_trees() << " trees\n"; // we'll let the user compute this query if they want it because it is somewhat expensive
         cout << "Minimum objective: " << result->min_objective << "\n";
         cout << "Cache sizes - Greedy: " << greedy_cache.size()
-            << ", Lickety: " << (use_kla ? lickety_cache_kla.size() : lickety_cache_k2.size())
+            << ", Lickety: " << (use_kla_cache() ? lickety_cache_kla.size() : lickety_cache_k2.size())
             << ", Trie: " << trie_cache.size();
         if (key_mode == KeyMode::EXACT) {
             cout << ", Unique masks: " << mask_ids.size();
@@ -437,8 +504,7 @@ private:
 
             auto LR = multipass_long(lossL, lossR, L, R, budget, depth); // while loop until converges
 
-            if (!LR.first || !LR.second || LR.first->hist.empty() || LR.second->hist.empty()) // safeguard, especially needed if we allow non-injective keys
-                continue;
+            if (!LR.first || !LR.second) continue; // safeguard, especially needed if we allow non-injective keys
 
             node->add_split(f, LR.first, LR.second); // add split with left and right subtries
         }
