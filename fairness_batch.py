@@ -2,13 +2,14 @@ import run_one_fairness
 import argparse
 
 
-algos = ["lickety", "treefarms"]
+algos = ["lickety", "treefarms", "bootstrap_greedy", "bootstrap_lickety"]
 depths = [3, 4, 5]
 regs = [0.01, 0.05, 0.1]
 mults = [0.01, 0.03, 0.05]
 data_paths = [
     "data/compas_w_demographics.csv"]
 slacks = [0.0]  # no slack for fairness experiments
+protected_attrs = ['race:African-American', 'sex:Male']
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -29,6 +30,8 @@ if __name__ == "__main__":
     index //= len(slacks)
     data_path = data_paths[index % len(data_paths)]
     index //= len(data_paths)
+    protected_attr = protected_attrs[index % len(protected_attrs)]
+    index //= len(protected_attrs)
     # check if file exists
     output_file = f"results/fairness_{data_path.split('/')[-1].replace('.csv','')}_{algo}_{depth}_{reg}_{mult}.csv"
     import os
@@ -42,5 +45,6 @@ if __name__ == "__main__":
         reg=reg,
         depth=depth,
         mult=mult,
-        multiplicative_slack=multiplicative_slack
+        multiplicative_slack=multiplicative_slack,
+        protected_col_name=protected_attr,
     )
