@@ -690,7 +690,7 @@ class LicketyRESPLIT:
                 best_feat = feat
                 best_lr = (left, right)
 
-        if best_feat is None or best_loss >= leaf_loss:
+        if best_feat is None:
             # no useful split (i.e the X are constant for every split, so every split was meaningless) OR split doesn't beat the leaf 
             if do_cache_l: self._lickety_cache_set(key, leaf_loss)
             return leaf_loss
@@ -710,8 +710,17 @@ class LicketyRESPLIT:
         #node = Node(feature=best_feat, left_child=left_node, right_child=right_node)
         #node.loss = lickety_loss
 
-        if do_cache_l: self._lickety_cache_set(key, lickety_loss)
-        return lickety_loss
+        # if do_cache_l: self._lickety_cache_set(key, lickety_loss)
+        # return lickety_loss
+
+        # now that we have recursed and know more than just the lookahead objective, take the better
+        if lickety_loss >= leaf_loss:
+            # better to stop and make this a leaf
+            if do_cache_l:
+                self._lickety_cache_set(key, leaf_loss)
+        if do_cache_l:
+            self._lickety_cache_set(key, lickety_loss) # the split was better
+        return leaf_loss
 
     #@profile
     def find_best_feature_to_split_on(self, bitvector, criterion: str = "entropy"):

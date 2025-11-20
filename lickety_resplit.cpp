@@ -607,6 +607,7 @@ private:
     }
 
     int lickety_split(const Packed& mask, int depth_budget, int k) {
+        if (k > depth_budget) k = depth_budget;
         const uint64_t kmask = key_of_mask(mask);
         const bool use_kla = use_kla_cache();
         K2  key2{kmask, depth_budget}; // two keys but only 1 will be used
@@ -733,7 +734,7 @@ extern "C" {
         }
         vector<int> y(y_data, y_data + n_samples);
         if (key_mode == 1) model->set_key_mode(LicketyRESPLIT::KeyMode::EXACT);
-        else               model->set_key_mode(LicketyRESPLIT::KeyMode::HASH64);
+        else model->set_key_mode(LicketyRESPLIT::KeyMode::HASH64);
         model->set_trie_cache_enabled(trie_cache_enabled != 0);
         model->set_multiplicative_slack(multiplicative_slack);
         model->fit(X, y, lambda, depth, rashomon_mult, lookahead_k);
@@ -751,4 +752,25 @@ extern "C" {
     int get_min_objective(LicketyRESPLIT* model) {
         return model->result ? model->result->min_objective : numeric_limits<int>::max();
     }
+
+    // number of distinct objective values at the root node - may or may not be useful
+    size_t get_root_hist_size(LicketyRESPLIT* model) {
+        if (!model || !model->result) return 0;
+        model->result->ensure_hist_built();
+        return model->result->hist.size();
+    }
+
+    // fill caller-provided buffers with (objective, count) pairs
+    void get_root_histogram(LicketyRESPLIT* model,
+                            int* objs_out,
+                            uint64_t* cnts_out) {
+        if (!model || !model->result) return;
+        model->result->ensure_hist_built();
+        const auto& hist = model->result->hist;
+        const size_t m = hist.size();
+        for (size_t i = 0; i < m; ++i) {
+            objs_out[i] = hist[i].obj;
+            cnts_out[i] = hist[i].cnt;
+        }
+    }    
 }
