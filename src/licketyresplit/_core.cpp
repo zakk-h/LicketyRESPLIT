@@ -2,7 +2,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
-#include "cpp/lickety_resplit.cpp
+#include "cpp/lickety_resplit.cpp"
 
 namespace py = pybind11;
 

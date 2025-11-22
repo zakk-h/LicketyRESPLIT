@@ -6,7 +6,6 @@ build-backend = "setuptools.build_meta"
 name = "licketyresplit"
 version = "0.0.1"
 description = "Rashomon set approximation via LicketyRESPLIT"
-readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
