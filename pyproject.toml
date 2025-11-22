@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "pybind11>=2.12"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "licketyresplit"
+version = "0.0.1"
+description = "Rashomon set approximation via LicketyRESPLIT"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+  { name = "Zakk Heile" },
+  { name = "Varun Babbar" },
+  { name = "Hayden McTavish" },
+  { name = "Cynthia Rudin" }
+]
+dependencies = ["numpy>=1.23"]
+
+[project.urls]
+Homepage = "https://github.com/zakk-h/LicketyRESPLIT"
