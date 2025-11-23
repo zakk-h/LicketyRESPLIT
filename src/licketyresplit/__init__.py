@@ -45,6 +45,11 @@ class LicketyRESPLIT:
 
     def get_root_histogram(self):
         return self._model.get_root_histogram()
+    
+    def get_tree_objective(self, tree_index: int):
+
+        obj, obj_norm = self._model.get_tree_objective(int(tree_index))
+        return obj, obj_norm
 
     # WARNING: 1-indexed unlike features
     def get_tree_paths(self, tree_index: int):

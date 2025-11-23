@@ -196,6 +196,17 @@ PYBIND11_MODULE(_core, m) {
         )
 
         .def(
+            "get_tree_objective",
+            [](const LicketyRESPLIT &self, std::uint64_t tree_index) {
+                auto obj_pair = self.get_ith_tree_objective(tree_index);
+                // obj_pair.first  = unnormalized objective (int)
+                // obj_pair.second = normalized objective (double)
+                return py::make_tuple(obj_pair.first, obj_pair.second);
+            },
+            py::arg("tree_index")
+        )
+
+        .def(
             "get_tree_paths",
             [](const LicketyRESPLIT &self, std::uint64_t tree_index) {
                 auto result = self.get_tree_paths(tree_index);

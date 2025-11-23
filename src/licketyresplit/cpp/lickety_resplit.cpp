@@ -514,6 +514,42 @@ public:
         return {paths, preds};
     }
 
+    // return (unnormalized_objective, normalized_objective) for the ith tree
+    std::pair<int, double> get_ith_tree_objective(std::uint64_t i) const {
+        if (!result) {
+            throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+        }
+
+        result->ensure_hist_built();
+
+        std::uint64_t total = result->count_trees();
+        if (i >= total) {
+            throw std::out_of_range("Tree index out of range in get_ith_tree_objective");
+        }
+
+        std::uint64_t cum = 0;
+        int target_obj = -1;
+
+        // hist is sorted by objective ascending
+        for (const auto& e : result->hist) {
+            if (i < cum + e.cnt) {
+                target_obj = e.obj;
+                break;
+            }
+            cum += e.cnt;
+        }
+
+        if (target_obj < 0) {
+            throw std::runtime_error("Failed to locate objective bucket in get_ith_tree_objective");
+        }
+
+        double normalized = (n_samples > 0)
+            ? static_cast<double>(target_obj) / static_cast<double>(n_samples)
+            : 0.0;
+
+        return {target_obj, normalized};
+    }
+
 
 
 
@@ -981,67 +1017,67 @@ private:
 
 };
 
-extern "C" {
-    LicketyRESPLIT* create_model() {
-        return new LicketyRESPLIT();
-    }
+// extern "C" {
+//     LicketyRESPLIT* create_model() {
+//         return new LicketyRESPLIT();
+//     }
 
-    void delete_model(LicketyRESPLIT* model) {
-        delete model;
-    }
+//     void delete_model(LicketyRESPLIT* model) {
+//         delete model;
+//     }
 
-    void fit_model(LicketyRESPLIT* model,
-                      const uint8_t* X_data, int n_samples, int n_features,
-                      const int* y_data,
-                      double lambda, int depth, double rashomon_mult,
-                      double multiplicative_slack,
-                      int key_mode,
-                      int trie_cache_enabled,
-                      int lookahead_k) {
-        vector<vector<bool>> X(n_features, vector<bool>(n_samples));
-        for (int f = 0; f < n_features; ++f) {
-            const uint8_t* col = X_data + (size_t)f * (size_t)n_samples;
-            for (int i = 0; i < n_samples; ++i) X[f][i] = (col[i] != 0);
-        }
-        vector<int> y(y_data, y_data + n_samples);
-        if (key_mode == 1) model->set_key_mode(LicketyRESPLIT::KeyMode::EXACT);
-        else model->set_key_mode(LicketyRESPLIT::KeyMode::HASH64);
-        model->set_trie_cache_enabled(trie_cache_enabled != 0);
-        model->set_multiplicative_slack(multiplicative_slack);
-        model->fit(X, y, lambda, depth, rashomon_mult, lookahead_k);
-    }
+//     void fit_model(LicketyRESPLIT* model,
+//                       const uint8_t* X_data, int n_samples, int n_features,
+//                       const int* y_data,
+//                       double lambda, int depth, double rashomon_mult,
+//                       double multiplicative_slack,
+//                       int key_mode,
+//                       int trie_cache_enabled,
+//                       int lookahead_k) {
+//         vector<vector<bool>> X(n_features, vector<bool>(n_samples));
+//         for (int f = 0; f < n_features; ++f) {
+//             const uint8_t* col = X_data + (size_t)f * (size_t)n_samples;
+//             for (int i = 0; i < n_samples; ++i) X[f][i] = (col[i] != 0);
+//         }
+//         vector<int> y(y_data, y_data + n_samples);
+//         if (key_mode == 1) model->set_key_mode(LicketyRESPLIT::KeyMode::EXACT);
+//         else model->set_key_mode(LicketyRESPLIT::KeyMode::HASH64);
+//         model->set_trie_cache_enabled(trie_cache_enabled != 0);
+//         model->set_multiplicative_slack(multiplicative_slack);
+//         model->fit(X, y, lambda, depth, rashomon_mult, lookahead_k);
+//     }
 
-    uint64_t get_tree_count(LicketyRESPLIT* model) {
-        return model->result ? model->result->count_trees() : 0ULL;
-    }
+//     uint64_t get_tree_count(LicketyRESPLIT* model) {
+//         return model->result ? model->result->count_trees() : 0ULL;
+//     }
 
-    uint64_t count_trees_leq(LicketyRESPLIT* model, int objective) {
-        if (!model || !model->result) return 0ULL;
-        return model->result->count_leq(objective);
-    }
+//     uint64_t count_trees_leq(LicketyRESPLIT* model, int objective) {
+//         if (!model || !model->result) return 0ULL;
+//         return model->result->count_leq(objective);
+//     }
 
-    int get_min_objective(LicketyRESPLIT* model) {
-        return model->result ? model->result->min_objective : numeric_limits<int>::max();
-    }
+//     int get_min_objective(LicketyRESPLIT* model) {
+//         return model->result ? model->result->min_objective : numeric_limits<int>::max();
+//     }
 
-    // number of distinct objective values at the root node - may or may not be useful
-    size_t get_root_hist_size(LicketyRESPLIT* model) {
-        if (!model || !model->result) return 0;
-        model->result->ensure_hist_built();
-        return model->result->hist.size();
-    }
+//     // number of distinct objective values at the root node - may or may not be useful
+//     size_t get_root_hist_size(LicketyRESPLIT* model) {
+//         if (!model || !model->result) return 0;
+//         model->result->ensure_hist_built();
+//         return model->result->hist.size();
+//     }
 
-    // fill caller-provided buffers with (objective, count) pairs
-    void get_root_histogram(LicketyRESPLIT* model,
-                            int* objs_out,
-                            uint64_t* cnts_out) {
-        if (!model || !model->result) return;
-        model->result->ensure_hist_built();
-        const auto& hist = model->result->hist;
-        const size_t m = hist.size();
-        for (size_t i = 0; i < m; ++i) {
-            objs_out[i] = hist[i].obj;
-            cnts_out[i] = hist[i].cnt;
-        }
-    }    
-}
+//     // fill caller-provided buffers with (objective, count) pairs
+//     void get_root_histogram(LicketyRESPLIT* model,
+//                             int* objs_out,
+//                             uint64_t* cnts_out) {
+//         if (!model || !model->result) return;
+//         model->result->ensure_hist_built();
+//         const auto& hist = model->result->hist;
+//         const size_t m = hist.size();
+//         for (size_t i = 0; i < m; ++i) {
+//             objs_out[i] = hist[i].obj;
+//             cnts_out[i] = hist[i].cnt;
+//         }
+//     }    
+// }
