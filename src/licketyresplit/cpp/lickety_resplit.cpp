@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <iostream>
+#include <stdexcept>
 
 using namespace std;
 
@@ -319,6 +320,13 @@ struct TreeTrieNode {
 
 };
 
+struct PredNode {
+    int feature;  // -1 for leaf
+    int prediction; // only meaningful if feature == -1
+    shared_ptr<PredNode> left;
+    shared_ptr<PredNode> right;
+};
+
 class LicketyRESPLIT {
 public:
     enum class KeyMode { HASH64, EXACT };
@@ -449,6 +457,67 @@ public:
         cout << ", Trie cache: " << (trie_cache_enabled ? "ON" : "OFF");
         cout << "\n";
     }
+
+    // predict using the i-th tree in the Rashomon set: X_row_major: binary [n_samples][n_features]
+    std::vector<uint8_t> get_predictions(uint64_t tree_index, const std::vector<std::vector<uint8_t>>& X_row_major) const {
+        if (!result) {
+            throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+        }
+
+        const std::size_t n_samples = X_row_major.size();
+        if (n_samples == 0) return {};
+
+        const std::size_t n_features = X_row_major[0].size();
+        if (static_cast<int>(n_features) != n_features) {
+            throw std::runtime_error("Prediction X has different number of features than training.");
+        }
+
+        auto tree = get_ith_tree(tree_index);
+        std::vector<uint8_t> out(n_samples, 0);
+
+        std::vector<int> idx(n_samples);
+        for (std::size_t i = 0; i < n_samples; ++i) {
+            idx[i] = static_cast<int>(i);
+        }
+
+        predict_tree_recursive(tree.get(), X_row_major, out, idx);
+        return out;
+    }
+
+    // get predictions from all trees in the rashomon set, as a vector of prediction vectors (one per tree).
+    std::vector<std::vector<uint8_t>> get_all_predictions(
+        const std::vector<std::vector<uint8_t>>& X_row_major
+    ) const {
+        uint64_t total = result ? result->count_trees() : 0ULL;
+        std::vector<std::vector<uint8_t>> all;
+        all.reserve(static_cast<std::size_t>(total));
+        for (uint64_t i = 0; i < total; ++i) {
+            all.push_back(get_predictions(i, X_row_major));
+        }
+        return all;
+    }
+
+    // paths[k] is a list of ints - one path per leaf; +f = went left on feature f, -f = went right. this array of a path encodes the splits in the tree to the kth leaf.
+    // predictions[k] is the 0/1 label at that leaf.
+    std::pair<std::vector<std::vector<int>>, std::vector<int>>
+    get_tree_paths(std::uint64_t tree_index) const {
+        if (!result) {
+            throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+        }
+
+        auto tree = get_ith_tree(tree_index);
+        std::vector<std::vector<int>> paths;
+        std::vector<int> preds;
+        std::vector<int> current;
+
+        collect_paths(tree.get(), current, paths, preds);
+        return {paths, preds};
+    }
+
+
+
+
+
 
 private:
     shared_ptr<TreeTrieNode> construct_trie(const Packed& mask, int depth, int budget) {
@@ -721,6 +790,195 @@ private:
         }
         return best_f;
     }
+
+    shared_ptr<PredNode> get_ith_tree(uint64_t i) const {
+        if (!result) {
+            throw runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+        }
+        result->ensure_hist_built();
+
+        uint64_t total = result->count_trees();
+        if (i >= total) {
+            throw out_of_range("Tree index out of range in get_ith_tree");
+        }
+
+        uint64_t cum = 0;
+        int target_obj = -1;
+        uint64_t k_within = 0;
+
+        // hist is sorted by objective ascending
+        for (const auto& e : result->hist) {
+            if (i < cum + e.cnt) {
+                target_obj = e.obj;
+                k_within = i - cum;
+                break;
+            }
+            cum += e.cnt;
+        }
+        if (target_obj < 0) {
+            throw runtime_error("Failed to locate objective bucket in get_ith_tree");
+        }
+
+        return get_kth_tree_with_objective(result.get(), target_obj, k_within);
+    }
+
+        shared_ptr<PredNode> get_kth_tree_with_objective(const TreeTrieNode* node, int target_obj, uint64_t k) const {
+        if (!node) {
+            throw runtime_error("Null node in get_kth_tree_with_objective");
+        }
+
+        node->ensure_hist_built();
+
+        // handle leaf-only trees at this node
+        for (const auto& leaf : node->leaves) {
+            if (leaf.loss == target_obj) {
+                if (k == 0) {
+                    auto t = make_shared<PredNode>();
+                    t->feature = -1;
+                    t->prediction = leaf.prediction;
+                    return t;
+                }
+                --k;
+            }
+        }
+
+        // handle splits
+        for (const auto& split : node->splits) {
+            const TreeTrieNode* L = split.left.get();
+            const TreeTrieNode* R = split.right.get();
+            if (!L || !R) continue;
+
+            L->ensure_hist_built();
+            R->ensure_hist_built();
+
+            // total_here = #trees under this split with exactly target_obj
+            uint64_t total_here = 0;
+
+            // R is sorted by obj, so we can binary search each r_obj
+            for (const auto& le : L->hist) {
+                int l_obj = le.obj;
+                uint64_t lc = le.cnt;
+                int r_obj = target_obj - l_obj;
+                // binary search r_obj in R->hist
+                auto it = lower_bound(
+                    R->hist.begin(), R->hist.end(),
+                    HistEntry{r_obj, 0},
+                    hist_less
+                );
+                if (it != R->hist.end() && it->obj == r_obj) {
+                    uint64_t rc = it->cnt;
+                    total_here += lc * rc;
+                }
+            }
+
+            if (k < total_here) { // we've been decrementing k so if we are now less than the number of trees in this split, it is in this split, the kth tree in this split
+                // the desired tree lies under this split.
+                uint64_t running = 0;
+                // counting how many trees each (l_obj, r_obj) contributes: for each l_obj, match the r_obj that meets target.
+                for (const auto& le : L->hist) {
+                    int l_obj = le.obj;
+                    uint64_t lc = le.cnt;
+                    int r_obj = target_obj - l_obj;
+
+                    auto it = lower_bound(
+                        R->hist.begin(), R->hist.end(),
+                        HistEntry{r_obj, 0},
+                        hist_less
+                    );
+                    if (it == R->hist.end() || it->obj != r_obj) continue;
+
+                    uint64_t rc = it->cnt;
+                    uint64_t pairs = lc * rc;
+
+                    if (running + pairs > k) { // k is smaller than the culm amount in this split we've seen so far (for the first time), so we know that we want to recurse on this split (which was already known), with this particular l_obj and r_obj, but we also need what index within each objective to recurse 
+                        uint64_t rel = k - running; // what index inside this block the tree lives (again, 0 indexed)
+                        uint64_t left_idx  = rel / rc; // left contributes lc possibilities, right contributes rc, a cross product without filtering, this indexing scheme works to break ties
+                        uint64_t right_idx = rel % rc;
+
+                        auto left_tree  = get_kth_tree_with_objective(L, l_obj,  left_idx); // now we have all the information we need, recurse
+                        auto right_tree = get_kth_tree_with_objective(R, r_obj, right_idx);
+
+                        auto t = make_shared<PredNode>();
+                        t->feature = split.feature;
+                        t->prediction = -1;
+                        t->left = left_tree;
+                        t->right = right_tree;
+                        return t;
+                    }
+
+                    running += pairs; // updating culm amount that work in this split
+                }
+
+                throw runtime_error("Inconsistent histogram counts in get_kth_tree_with_objective");
+            } else {
+                // skip all trees from this split that achieve target_obj
+                k -= total_here;
+            }
+        }
+
+        throw out_of_range("Index out of range for given objective in get_kth_tree_with_objective");
+    }
+
+    void predict_tree_recursive(const PredNode* node, const std::vector<std::vector<uint8_t>>& X_row_major, std::vector<uint8_t>& out, const std::vector<int>& idx) const {
+        if (!node) return;
+
+        // leaf: assign prediction to all indices in this subset.
+        if (node->feature < 0) {
+            uint8_t pred = static_cast<uint8_t>(node->prediction);
+            for (int row : idx) {
+                out[row] = pred;
+            }
+            return;
+        }
+
+        // internal node: split indices by feature
+        int f = node->feature;
+        std::vector<int> left_idx;
+        std::vector<int> right_idx;
+        left_idx.reserve(idx.size());
+        right_idx.reserve(idx.size());
+
+        for (int row : idx) {
+            uint8_t v = X_row_major[row][f];
+            if (v) left_idx.push_back(row); // 1 is left
+            else   right_idx.push_back(row);
+        }
+
+        if (!left_idx.empty()) {
+            predict_tree_recursive(node->left.get(), X_row_major, out, left_idx);
+        }
+        if (!right_idx.empty()) {
+            predict_tree_recursive(node->right.get(), X_row_major, out, right_idx);
+        }
+    }
+
+    void collect_paths(const PredNode* node, std::vector<int>& current, std::vector<std::vector<int>>& paths, std::vector<int>& preds) const {
+        if (!node) return;
+
+        // leaf: record this path and prediction
+        if (node->feature < 0) {
+            paths.push_back(current); // current starts empty and is appended to along the dfs
+            preds.push_back(node->prediction);
+            return;
+        }
+
+        int f = node->feature;
+        // IMPORTANT: we have to switch to 1-indexing here so that +- for the 0th (1st) feature means something
+
+
+        // go left (true) -> +f or rather f+1
+        current.push_back(f+1);
+        collect_paths(node->left.get(), current, paths, preds);
+        current.pop_back(); // backtrack after we complete a path so we have 1 vector that is updated in a nice way throughout this
+
+        // Go right (false) -> -f (technically -(f+1))
+        current.push_back(-(f+1));
+        collect_paths(node->right.get(), current, paths, preds);
+        current.pop_back();
+    }
+
+
+
 };
 
 extern "C" {
