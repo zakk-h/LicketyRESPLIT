@@ -1,2 +1,0 @@
-regularization,rashomon_bound_multiplier,depth,lickety_true_none_time,lickety_true_none_num_trees,lickety_true_gosdt_time,lickety_true_gosdt_num_trees,lickety_false_none_time,lickety_false_none_num_trees,lickety_false_gosdt_time,lickety_false_gosdt_num_trees,treefarms_time,treefarms_num_trees,resplit_treefarms_time,resplit_treefarms_num_trees
-0.005,0.01,4,3.2606036849319935,0,1.8065657392144203,0,71.69310310482979,108,67.4545004889369,29,516.4055253304541,335,1310.497802440077,27000348

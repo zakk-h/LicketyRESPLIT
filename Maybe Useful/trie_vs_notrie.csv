@@ -1,2 +1,0 @@
-regularization,rashomon_mult,depth,trie_true_time,trie_true_num_trees,notrie_true_time,notrie_true_num_trees,trie_false_time,trie_false_num_trees,notrie_false_time,notrie_false_num_trees
-0.01,0.01,4,19.238036137074232,22,22.642973359674215,22,19.297781717032194,22,22.459400851279497,22
