@@ -22,9 +22,17 @@ class LicketyRESPLIT:
         key_mode="hash",
         trie_cache_enabled=False,
         lookahead_k=1,
+        root_budget=None, # be weary - expected integerized already
+        use_multipass=True, 
+        rule_list_mode=False
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
+        
+        if root_budget is None:
+            root_budget_int = -1
+        else:
+            root_budget_int = int(root_budget)
         self._model.fit(
             X,
             y,
@@ -35,6 +43,9 @@ class LicketyRESPLIT:
             key_mode,
             trie_cache_enabled,
             lookahead_k,
+            root_budget_int,
+            bool(use_multipass), 
+            bool(rule_list_mode),   
         )
 
     def count_trees(self):

@@ -23,7 +23,11 @@ PYBIND11_MODULE(_core, m) {
                double multiplicative_slack,
                std::string key_mode_str,
                bool trie_cache_enabled,
-               int lookahead_k) {
+               int lookahead_k,
+               int root_budget,
+               bool use_multipass,
+               bool rule_list_mode
+            ) {
 
                 py::buffer_info xinfo = X.request();
                 py::buffer_info yinfo = y.request();
@@ -60,9 +64,20 @@ PYBIND11_MODULE(_core, m) {
                 self.set_key_mode(km);
                 self.set_trie_cache_enabled(trie_cache_enabled);
                 self.set_multiplicative_slack(multiplicative_slack);
+                self.set_use_multipass(use_multipass);
+                self.set_rule_list_mode(rule_list_mode);
 
-                self.fit(X_col_major, y_vec, lambda_reg,
-                         depth_budget, rashomon_mult, lookahead_k);
+                self.fit(
+                    X_col_major,
+                    y_vec,
+                    lambda_reg,
+                    depth_budget,
+                    rashomon_mult,
+                    lookahead_k,
+                    root_budget,
+                    use_multipass,
+                    rule_list_mode
+                );
             },
             py::arg("X"),
             py::arg("y"),
@@ -72,7 +87,10 @@ PYBIND11_MODULE(_core, m) {
             py::arg("multiplicative_slack") = 0.0,
             py::arg("key_mode") = "hash",
             py::arg("trie_cache_enabled") = false,
-            py::arg("lookahead_k") = 1
+            py::arg("lookahead_k") = 1,
+            py::arg("root_budget") = -1,
+            py::arg("use_multipass") = true,
+            py::arg("rule_list_mode") = false
         )
 
         .def("count_trees",

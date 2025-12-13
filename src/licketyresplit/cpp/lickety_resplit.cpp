@@ -350,7 +350,9 @@ private:
     bool trie_cache_enabled = true;
     MaskIdTable mask_ids; // used only if in exact mode
 
-    int lookahead_init = 1; // to change 
+    int lookahead_init = 1; // will be changed later
+    bool use_multipass = true; // sim
+    bool rule_list_mode = false;
 
     unordered_map<K2, int, K2::Hash> greedy_cache;
     unordered_map<K2,  int, K2::Hash>  lickety_cache_k2; // used when lookahead_init <= 1
@@ -403,15 +405,26 @@ public:
     void set_key_mode(KeyMode m) { key_mode = m; }
     void set_trie_cache_enabled(bool on) { trie_cache_enabled = on; }
     void set_multiplicative_slack(double s) { multiplicative_slack = s; }
+    void set_use_multipass(bool on) { use_multipass = on; }
+    void set_rule_list_mode(bool on) { rule_list_mode = on; }
 
-    void fit(const vector<vector<bool>>& X_col_major, const vector<int>& y,
-             double lambda, int depth_budget, double rashomon_mult, int lookahead_k) {
+    void fit(const std::vector<std::vector<bool>>& X_col_major,
+             const std::vector<int>& y,
+             double lambda,
+             int depth_budget,
+             double rashomon_mult,
+             int lookahead_k,
+             int root_budget,
+             bool use_multipass_flag,
+             bool rule_list_mode_flag) {
         n_features = (int)X_col_major.size();
         n_samples  = (int)X_col_major[0].size();
         n_words = (n_samples + 63) / 64; // 64 -> 1, 65 -> 2
         tail_mask = (n_samples % 64) ? ((1ULL << (n_samples % 64)) - 1ULL) : ~0ULL; // if multiple of 64, all 1s. otherwise, n_samples % 64 1s followed by 0s.
         lamN = (int)llround(lambda * (double)n_samples);
         lookahead_init = lookahead_k;
+        use_multipass = use_multipass_flag;
+        rule_list_mode = rule_list_mode_flag;
 
         X_bits.assign(n_features, Packed(n_words)); // length n_features with entries of Packed, initialized to all 0s bits, we will set below.
         for (int f = 0; f < n_features; ++f) {
@@ -432,17 +445,24 @@ public:
         for (int i = 0; i < n_words-1; ++i) root.w[i] = ~0ULL; // not 0, so all 1.
         root.w[n_words-1] = tail_mask; // enforce 0s for out of scope
 
-        if (lookahead_init <= 0) { // set based on greedy even if our oracle is a leaf
-            best_objective = train_greedy(root, depth_budget);
+        if (root_budget >= 0) {
+            // user-specified bound: skip reference solution
+            obj_bound = root_budget;
+            std::cout << "Objective bound (user-set): " << obj_bound << "\n";
+
         } else {
-            best_objective = lickety_split(root, depth_budget, lookahead_init);
+            if (lookahead_init <= 0) { // set based on greedy even if our oracle is a leaf
+                best_objective = train_greedy(root, depth_budget);
+            } else {
+                best_objective = lickety_split(root, depth_budget, lookahead_init);
+            }
+            cout << "Best objective: " << best_objective
+                << " (" << (double)best_objective / (double)n_samples << ")\n";
+
+            obj_bound = (int)llround(best_objective * (1.0 + rashomon_mult) * (1.0 + multiplicative_slack));
+
+            cout << "Objective bound: " << obj_bound << "\n";
         }
-        cout << "Best objective: " << best_objective
-             << " (" << (double)best_objective / (double)n_samples << ")\n";
-
-        obj_bound = (int)llround(best_objective * (1.0 + rashomon_mult) * (1.0 + multiplicative_slack));
-
-        cout << "Objective bound: " << obj_bound << "\n";
 
         result = construct_trie(root, depth_budget, obj_bound);
 
@@ -550,6 +570,8 @@ public:
         return {target_obj, normalized};
     }
 
+    
+
 
 
 
@@ -610,11 +632,20 @@ private:
                 lossL = lickety_split(L, depth - 1, lookahead_init);
                 lossR = lickety_split(R, depth - 1, lookahead_init);
             }
-            if (lossL + lossR > budget) continue; // approximation decision tree rashomon set
-            // if (lossL >= budget && lossR >= budget) continue; // exact rule list rashomon set
- 
-            auto LR = multipass_long(lossL, lossR, L, R, budget, depth); // while loop until converges
+            if (!rule_list_mode) {
+                if (lossL + lossR > budget) continue; // approximation decision tree rashomon set
+            } else {
+                if (lossL > budget - lamN && lossR > budget - lamN) continue; // exact rule list rashomon set. if you can't afford a leaf on either side, stop
+            }
 
+            std::pair<std::shared_ptr<TreeTrieNode>, std::shared_ptr<TreeTrieNode>> LR; 
+            if (rule_list_mode) {
+                LR = rule_list_alloc(lossL, lossR, L, R, budget, depth);
+            } else if (use_multipass) { // while loop until converges
+                LR = multipass_long(lossL, lossR, L, R, budget, depth);
+            } else {
+                LR = singlepass_alloc(lossL, lossR, L, R, budget, depth);
+            }
             if (!LR.first || !LR.second) continue; // safeguard, especially needed if we allow non-injective keys
 
             node->add_split(f, LR.first, LR.second); // add split with left and right subtries
@@ -669,6 +700,87 @@ private:
 
         return {left_node, right_node};
     }
+
+    // this is solely for ableation study purposes - if practical we would subtract minobjective from the other side
+    std::pair<std::shared_ptr<TreeTrieNode>, std::shared_ptr<TreeTrieNode>>
+    singlepass_alloc(int loss_l, int loss_r, const Packed& Lmask, const Packed& Rmask,
+                     int budget, int depth) {
+        int left_budget  = budget - loss_r;
+        int right_budget = budget - loss_l;
+
+        std::shared_ptr<TreeTrieNode> left_node  = nullptr;
+        std::shared_ptr<TreeTrieNode> right_node = nullptr;
+
+        if (left_budget >= 0) { // robustness incase we change pruning
+            left_node = construct_trie(Lmask, depth - 1, left_budget);
+        }
+        if (right_budget >= 0) {
+            right_node = construct_trie(Rmask, depth - 1, right_budget);
+        }
+
+        return {left_node, right_node};
+    
+    }
+
+    std::pair<std::shared_ptr<TreeTrieNode>, std::shared_ptr<TreeTrieNode>>
+    rule_list_alloc(int loss_l, int loss_r, const Packed& Lmask, const Packed& Rmask,
+                    int budget, int depth) {
+        using std::shared_ptr;
+        const int INF = std::numeric_limits<int>::max();
+
+        int left_candidate  = budget - loss_r;
+        int right_candidate = budget - loss_l;
+
+        // if we can't even fit a leaf on either side, then we cannot yield a valid rule list
+        if (left_candidate < 0 && right_candidate < 0) {
+            return {nullptr, nullptr};
+        }
+
+        // decide which side to solve first:
+        // if only one is non-negative, use that one.
+        // if both are non-negative, pick the one with more candidate budget (doesn't matter)
+        // why do we need this? because rule lists put a leaf on one side. if putting one on one side would yield a negative budget for the other side, but putting a leaf on the other side wouldn't, then we know we put the leaf on that side and solve it first.
+        bool solve_left_first;
+        if (left_candidate >= 0 && right_candidate < 0) {
+            solve_left_first = true;
+        } else if (right_candidate >= 0 && left_candidate < 0) {
+            solve_left_first = false;
+        } else {
+            // both >= 0
+            solve_left_first = (left_candidate >= right_candidate);
+        }
+
+        shared_ptr<TreeTrieNode> left_node  = nullptr;
+        shared_ptr<TreeTrieNode> right_node = nullptr;
+
+        if (solve_left_first) {
+            int left_budget = left_candidate;
+            if (left_budget >= 0) {
+                left_node = construct_trie(Lmask, depth - 1, left_budget);
+                int min_left = left_node ? left_node->min_objective : INF;
+
+                // remaining budget for the right side is B - min_left to be more optimal than assuming leaf loss on left
+                int right_budget = (min_left == INF) ? -1 : (budget - min_left);
+                if (right_budget >= 0) {
+                    right_node = construct_trie(Rmask, depth - 1, right_budget);
+                }
+            }
+        } else {
+            int right_budget = right_candidate;
+            if (right_budget >= 0) {
+                right_node = construct_trie(Rmask, depth - 1, right_budget);
+                int min_right = right_node ? right_node->min_objective : INF;
+
+                int left_budget = (min_right == INF) ? -1 : (budget - min_right);
+                if (left_budget >= 0) {
+                    left_node = construct_trie(Lmask, depth - 1, left_budget);
+                }
+            }
+        }
+
+        return {left_node, right_node};
+    }
+
 
     int leaf_objective(const Packed& mask) const {
         const int n_sub = count_total(mask);
