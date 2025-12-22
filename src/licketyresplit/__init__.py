@@ -22,9 +22,11 @@ class LicketyRESPLIT:
         key_mode="hash",
         trie_cache_enabled=False,
         lookahead_k=1,
+        oracle_style=0, 
         root_budget=None, # be weary - expected integerized already
         use_multipass=True, 
-        rule_list_mode=False
+        rule_list_mode=False,
+        majority_leaf_only=False,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -45,7 +47,9 @@ class LicketyRESPLIT:
             lookahead_k,
             root_budget_int,
             bool(use_multipass), 
-            bool(rule_list_mode),   
+            bool(rule_list_mode), 
+            int(oracle_style), 
+            bool(majority_leaf_only),
         )
 
     def count_trees(self):
@@ -236,4 +240,11 @@ class LicketyRESPLIT:
         ax.set_axis_off()
         plt.title(f"LicketyRESPLIT Tree {tree_index}")
         plt.show()
+        
+    def get_tree_frontier_scores(self, tree_index: int, depth_budget: int):
+        # returns a list of (depth_from_root, frontier_score) for each internal node of the specified tree. Root has depth 0.
+        return self._model.get_tree_frontier_scores(int(tree_index), int(depth_budget))
+
+    def root_lickety_objective_lookahead1(self, depth_budget: int):
+        return int(self._model.root_lickety_objective_lookahead1(int(depth_budget)))
 

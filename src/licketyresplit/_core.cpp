@@ -26,7 +26,9 @@ PYBIND11_MODULE(_core, m) {
                int lookahead_k,
                int root_budget,
                bool use_multipass,
-               bool rule_list_mode
+               bool rule_list_mode,
+               int oracle_style,
+               bool majority_leaf_only
             ) {
 
                 py::buffer_info xinfo = X.request();
@@ -76,7 +78,9 @@ PYBIND11_MODULE(_core, m) {
                     lookahead_k,
                     root_budget,
                     use_multipass,
-                    rule_list_mode
+                    rule_list_mode,
+                    oracle_style,
+                    majority_leaf_only
                 );
             },
             py::arg("X"),
@@ -90,7 +94,9 @@ PYBIND11_MODULE(_core, m) {
             py::arg("lookahead_k") = 1,
             py::arg("root_budget") = -1,
             py::arg("use_multipass") = true,
-            py::arg("rule_list_mode") = false
+            py::arg("rule_list_mode") = false,
+            py::arg("oracle_style") = 0,
+            py::arg("majority_leaf_only") = false
         )
 
         .def("count_trees",
@@ -250,5 +256,25 @@ PYBIND11_MODULE(_core, m) {
                 return py::make_tuple(py_paths, py_preds);
             },
             py::arg("tree_index")
+        )
+
+        .def(
+            "get_tree_frontier_scores",
+            [](LicketyRESPLIT &self, std::uint64_t tree_index, int depth_budget) {
+                auto vec = self.get_tree_frontier_scores(tree_index, depth_budget);
+                return vec;
+            },
+            py::arg("tree_index"),
+            py::arg("depth_budget")
+        )
+
+        .def(
+            "root_lickety_objective_lookahead1",
+            [](LicketyRESPLIT &self, int depth_budget) {
+                return self.root_lickety_objective_lookahead1(depth_budget);
+            },
+            py::arg("depth_budget")
         );
+
+
 }

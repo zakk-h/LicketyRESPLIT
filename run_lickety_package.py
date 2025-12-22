@@ -7,21 +7,24 @@ import numpy as np
 import pandas as pd
 from licketyresplit import LicketyRESPLIT
 
-DEFAULT_CSV = "Datasets/Processed/churn_binarized.csv"
-DEFAULT_LAMBDA = 0.002
-DEFAULT_DEPTH = 10
-DEFAULT_MULT = 0.0003
-DEFAULT_KEYS = "hash"          # {"hash","exact"}
-DEFAULT_TRIE_CACHE = False     # True/False
-DEFAULT_LOOKAHEAD = 0
+DEFAULT_CSV = "Datasets/Processed/magic_binarized.csv"
+DEFAULT_LAMBDA = 0.01
+DEFAULT_DEPTH = 5
+DEFAULT_MULT = 0.01
+DEFAULT_KEYS = "hash" # {"hash","exact"}
+DEFAULT_TRIE_CACHE = False # True/False
+DEFAULT_LOOKAHEAD = 2
+DEFAULT_ORACLE_STYLE = 2
 DEFAULT_MULT_SLACK = 0.0
+DEFAULT_USE_MULTIPASS = True
+DEFAULT_RULE_LIST_MODE = False
+DEFAULT_MAJORITY_LEAF_ONLY = False
 
 
 def _peak_rss_bytes() -> int:
     """Peak RSS in bytes for this process (since start)."""
     ru = resource.getrusage(resource.RUSAGE_SELF)
     rss = ru.ru_maxrss
-    # On Linux ru_maxrss is KiB, so convert to bytes
     rss *= 1024
     return int(rss)
 
@@ -30,14 +33,13 @@ def _fmt_bytes(b: int) -> str:
     v = float(b)
     for unit in ["B", "KiB", "MiB", "GiB", "TiB"]:
         if v < 1024.0 or unit == "TiB":
-            return f"{v:.2f} {unit}"
+            return f"{v:.4f} {unit}"
         v /= 1024.0
-    return f"{v:.2f} B"
+    return f"{v:.4f} B"
 
 
 def main():
     import argparse
-
     p = argparse.ArgumentParser(description="LicketyRESPLIT (Python package)")
     p.add_argument("--csv", type=str, default=DEFAULT_CSV,
                    help="Path to CSV (last col = label).")
@@ -59,6 +61,18 @@ def main():
                    help="Lookahead k (oracle strength).")
     p.add_argument("--mult-slack", type=float, default=DEFAULT_MULT_SLACK,
                    help="Multiplicative slack on Rashomon bound.")
+    p.add_argument("--oracle-style", type=int, default=DEFAULT_ORACLE_STYLE, choices=[0, 1, 2],
+                   help="Oracle style (0=const, 1=cycle, 2=cycle-consistent).")
+    p.add_argument("--multipass", choices=["on", "off"],
+                   default=("on" if DEFAULT_USE_MULTIPASS else "off"),
+                   help="Use multipass allocation (on/off).")
+    p.add_argument("--rule-list", choices=["on", "off"],
+                   default=("on" if DEFAULT_RULE_LIST_MODE else "off"),
+                   help="Use exact rule-list mode pruning/allocation (on/off).")
+    p.add_argument("--majority-leaf", choices=["on", "off"],
+                   default=("on" if DEFAULT_MAJORITY_LEAF_ONLY else "off"),
+                   help="Only add the majority-label leaf at each node (on/off).")
+
     args = p.parse_args()
 
     csv_path = Path(args.csv).resolve()
@@ -85,7 +99,10 @@ def main():
         key_mode=args.keys,
         trie_cache_enabled=(args.trie_cache == "on"),
         lookahead_k=args.lookahead,
-        use_multipass=True,
+        use_multipass=(args.multipass == "on"),
+        rule_list_mode=(args.rule_list == "on"),
+        oracle_style=args.oracle_style,
+        majority_leaf_only=(args.majority_leaf == "on"),
     )
 
     t1 = time.perf_counter()

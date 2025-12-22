@@ -353,6 +353,10 @@ private:
     int lookahead_init = 1; // will be changed later
     bool use_multipass = true; // sim
     bool rule_list_mode = false;
+    bool majority_leaf_only = false;
+
+    int oracle_style = 0; // 0=constant k (current), 1=cyclic, 2=cyclic-consistent
+    std::vector<int> k_at_depth; // size depth_budget (only used for style 2)
 
     unordered_map<K2, int, K2::Hash> greedy_cache;
     unordered_map<K2,  int, K2::Hash>  lickety_cache_k2; // used when lookahead_init <= 1
@@ -407,6 +411,7 @@ public:
     void set_multiplicative_slack(double s) { multiplicative_slack = s; }
     void set_use_multipass(bool on) { use_multipass = on; }
     void set_rule_list_mode(bool on) { rule_list_mode = on; }
+    void set_majority_leaf_only(bool on) { majority_leaf_only = on; }
 
     void fit(const std::vector<std::vector<bool>>& X_col_major,
              const std::vector<int>& y,
@@ -416,7 +421,9 @@ public:
              int lookahead_k,
              int root_budget,
              bool use_multipass_flag,
-             bool rule_list_mode_flag) {
+             bool rule_list_mode_flag,
+             int oracle_style_in,
+             bool majority_leaf_only_flag) {
         n_features = (int)X_col_major.size();
         n_samples  = (int)X_col_major[0].size();
         n_words = (n_samples + 63) / 64; // 64 -> 1, 65 -> 2
@@ -425,6 +432,7 @@ public:
         lookahead_init = lookahead_k;
         use_multipass = use_multipass_flag;
         rule_list_mode = rule_list_mode_flag;
+        majority_leaf_only = majority_leaf_only_flag;
 
         X_bits.assign(n_features, Packed(n_words)); // length n_features with entries of Packed, initialized to all 0s bits, we will set below.
         for (int f = 0; f < n_features; ++f) {
@@ -463,6 +471,21 @@ public:
 
             cout << "Objective bound: " << obj_bound << "\n";
         }
+
+        oracle_style = oracle_style_in;
+
+        if (oracle_style == 2) { // we define to be depth_budget+1 size but depth 0 doesn't actually matter
+            k_at_depth.assign(depth_budget + 1, 1);
+            int K = lookahead_init;
+            int kk = K;
+            for (int d = depth_budget; d >= 0; --d) {
+                k_at_depth[d] = std::min(d, kk);
+                kk = (kk > 1) ? (kk - 1) : K; // increment down then wrap
+            }
+        } else {
+            k_at_depth.clear();
+        }
+
 
         result = construct_trie(root, depth_budget, obj_bound);
 
@@ -570,12 +593,47 @@ public:
         return {target_obj, normalized};
     }
 
-    
+    // (depth_from_root, frontier_sum_obj) for each internal node of a specific materialized tree
+    std::vector<std::pair<int,int>>
+    get_tree_frontier_scores(uint64_t tree_index, int depth_budget) {
+        if (!result) {
+            throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+        }
 
+        auto tree = get_ith_tree(tree_index);
 
+        // root mask = all samples active
+        Packed root(n_words);
+        for (int i = 0; i < n_words - 1; ++i) root.w[i] = ~0ULL;
+        root.w[n_words - 1] = tail_mask;
 
+        std::vector<SibEntry> sib_stack;
+        std::vector<std::pair<int,int>> out;
 
+        frontier_scores_dfs_(
+            tree.get(),
+            root,
+            /*depth_remaining=*/depth_budget,
+            /*depth_from_root=*/0,
+            sib_stack,
+            out
+        );
 
+        return out;
+    }
+
+    // root LicketySPLIT objective with lookahead=1 so the user can compare frontier cuts to the reference solution
+    int root_lickety_objective_lookahead1(int depth_budget) {
+        if (n_samples == 0) {
+            throw std::runtime_error("Model not fitted.");
+        }
+
+        Packed root(n_words);
+        for (int i = 0; i < n_words - 1; ++i) root.w[i] = ~0ULL;
+        root.w[n_words - 1] = tail_mask;
+
+        return lickety_split(root, depth_budget, /*k=*/1);
+    }
 
 private:
     shared_ptr<TreeTrieNode> construct_trie(const Packed& mask, int depth, int budget) {
@@ -599,14 +657,34 @@ private:
         const int pos = count_pos(mask);
 
         // braces make temporary local scope so variables created will cease to persist
+        // {
+        //     int mis0 = pos;
+        //     int mis1 = n_sub - pos;
+        //     int cost0 = lamN + mis0;
+        //     int cost1 = lamN + mis1;
+        //     if (cost0 <= budget) node->add_leaf(0, cost0);
+        //     if (cost1 <= budget) node->add_leaf(1, cost1);
+        // }
+
         {
             int mis0 = pos;
             int mis1 = n_sub - pos;
-            int cost0 = lamN + mis0;
-            int cost1 = lamN + mis1;
-            if (cost0 <= budget) node->add_leaf(0, cost0);
-            if (cost1 <= budget) node->add_leaf(1, cost1);
+
+            if (!majority_leaf_only) {
+                int cost0 = lamN + mis0;
+                int cost1 = lamN + mis1;
+                if (cost0 <= budget) node->add_leaf(0, cost0);
+                if (cost1 <= budget) node->add_leaf(1, cost1);
+            } else {
+                // choose the majority-label leaf (i.e., the one with fewer misclassifications)
+                // tie-break rule: predict 1 when mis0 == mis1
+                int pred = (mis1 <= mis0) ? 1 : 0;
+                int best_mis = std::min(mis0, mis1);
+                int best_cost = lamN + best_mis;
+                if (best_cost <= budget) node->add_leaf(pred, best_cost);
+            }
         }
+
 
         if (depth == 0 || budget < 2 * lamN) {
             if (trie_cache_enabled) trie_cache.emplace(key, node);
@@ -614,6 +692,10 @@ private:
         }
 
         Packed L(n_words), R(n_words);
+
+        const int k_here = (oracle_style == 2 && depth >= 0 && depth < (int)k_at_depth.size())
+            ? k_at_depth[depth-1]
+            : lookahead_init;
 
         for (int f = 0; f < n_features; ++f) {
             and_bits(mask, X_bits[f], L);
@@ -629,8 +711,8 @@ private:
                 lossL = train_greedy(L, depth - 1);
                 lossR = train_greedy(R, depth - 1);
             } else {
-                lossL = lickety_split(L, depth - 1, lookahead_init);
-                lossR = lickety_split(R, depth - 1, lookahead_init);
+                lossL = lickety_split(L, depth - 1, k_here);
+                lossR = lickety_split(R, depth - 1, k_here);
             }
             if (!rule_list_mode) {
                 if (lossL + lossR > budget) continue; // approximation decision tree rashomon set
@@ -836,6 +918,12 @@ private:
             return lickety_split(m, depth, k);
     }
 
+    inline int next_k_cycle(int k) const {
+        // cycle: ... 3->2->1->K->K-1->...
+        return (k > 1) ? (k - 1) : lookahead_init;
+    }
+
+
     int lickety_split(const Packed& mask, int depth_budget, int k) {
         if (k > depth_budget) k = depth_budget;
         const uint64_t kmask = key_of_mask(mask);
@@ -894,16 +982,26 @@ private:
         //     int right_loss = lickety_split(bestR, depth_budget - 1);
         //     ans = left_loss + right_loss;
         // }
+        int k_recurse;
+        if (oracle_style == 0) {
+                k_recurse = k; // constant
+        } else {
+            k_recurse = (child_k == 0) ? lookahead_init : child_k; // restart when 0
+        }
+
+
         int ans = leaf_loss; 
         if (best_feat >= 0) {
-            const int left_loss  = lickety_split(bestL, depth_budget - 1, k);
-            const int right_loss = lickety_split(bestR, depth_budget - 1, k);
+            const int left_loss  = lickety_split(bestL, depth_budget - 1, k_recurse);
+            const int right_loss = lickety_split(bestR, depth_budget - 1, k_recurse);
             ans = min(ans, left_loss + right_loss); // do lickety even if leaf is better over greedy and see which is preferred
         }
         if (use_kla) lickety_cache_kla.emplace(keyla, ans);
         else lickety_cache_k2.emplace(key2,  ans);
         return ans;
     }
+
+
 
     int find_best_split(const Packed& mask) const {
         const int n_sub = count_total(mask);
@@ -1119,10 +1217,83 @@ private:
         collect_paths(node->left.get(), current, paths, preds);
         current.pop_back(); // backtrack after we complete a path so we have 1 vector that is updated in a nice way throughout this
 
-        // Go right (false) -> -f (technically -(f+1))
+        // go right (false) -> -f (technically -(f+1))
         current.push_back(-(f+1));
         collect_paths(node->right.get(), current, paths, preds);
         current.pop_back();
+    }
+
+    // helper: add node (mask, depth_remaining) uniquely; if new, add lickety_split(mask, depth_remaining, 1)
+    inline void add_frontier_unique_(
+        const Packed& mask,
+        int depth_remaining,
+        std::unordered_set<K2, K2::Hash>& seen,
+        int& running_sum
+    ) {
+        if (depth_remaining < 0) return;
+        const uint64_t km = key_of_mask(mask);
+        K2 key{km, depth_remaining};
+        auto [it, inserted] = seen.insert(key);
+        if (!inserted) return;
+        running_sum += lickety_split(mask, depth_remaining, 1);
+    }
+
+    struct SibEntry {
+        Packed mask;
+        int depth_remaining;
+    };
+
+    // dfs over a concrete tree, computing frontier score at each internal node.
+    void frontier_scores_dfs_(
+        const PredNode* node,
+        const Packed& cur_mask,
+        int depth_remaining,
+        int depth_from_root,
+        std::vector<SibEntry>& sib_stack,
+        std::vector<std::pair<int,int>>& out
+    ) {
+        if (!node) return;
+        if (node->feature < 0) return; // leaf: no entry
+
+        const int f = node->feature;
+
+        // children masks for this node
+        Packed L(n_words), R(n_words);
+        and_bits(cur_mask, X_bits[f], L);
+        andnot_bits(cur_mask, X_bits[f], R);
+
+        // frontier score for this internal node
+        {
+            std::unordered_set<K2, K2::Hash> seen;
+            int sum_obj = 0;
+
+            // siblings along the path (excluding root, including current node via sib_stack invariant)
+            for (const auto& sib : sib_stack) {
+                add_frontier_unique_(sib.mask, sib.depth_remaining, seen, sum_obj);
+            }
+
+            // union with the two children of this node
+            add_frontier_unique_(L, depth_remaining - 1, seen, sum_obj);
+            add_frontier_unique_(R, depth_remaining - 1, seen, sum_obj);
+
+            out.emplace_back(depth_from_root, sum_obj);
+        }
+
+        if (depth_remaining <= 0) return;
+
+        // recurse left: push sibling (R) for the left child
+        if (node->left) {
+            sib_stack.push_back({R, depth_remaining - 1});
+            frontier_scores_dfs_(node->left.get(), L, depth_remaining - 1, depth_from_root + 1, sib_stack, out);
+            sib_stack.pop_back(); // undo after exploring
+        }
+
+        // recurse right: push sibling (L) for the right child
+        if (node->right) {
+            sib_stack.push_back({L, depth_remaining - 1});
+            frontier_scores_dfs_(node->right.get(), R, depth_remaining - 1, depth_from_root + 1, sib_stack, out);
+            sib_stack.pop_back();
+        }
     }
 
 
