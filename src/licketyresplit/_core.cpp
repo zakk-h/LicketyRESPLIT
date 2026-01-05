@@ -28,7 +28,9 @@ PYBIND11_MODULE(_core, m) {
                bool use_multipass,
                bool rule_list_mode,
                int oracle_style,
-               bool majority_leaf_only
+               bool majority_leaf_only,
+               bool cache_cheap_subproblems,
+               int greedy_split_mode
             ) {
 
                 py::buffer_info xinfo = X.request();
@@ -68,6 +70,8 @@ PYBIND11_MODULE(_core, m) {
                 self.set_multiplicative_slack(multiplicative_slack);
                 self.set_use_multipass(use_multipass);
                 self.set_rule_list_mode(rule_list_mode);
+                self.set_cache_cheap_subproblems(cache_cheap_subproblems);
+                self.set_greedy_split_mode(greedy_split_mode);
 
                 self.fit(
                     X_col_major,
@@ -80,7 +84,8 @@ PYBIND11_MODULE(_core, m) {
                     use_multipass,
                     rule_list_mode,
                     oracle_style,
-                    majority_leaf_only
+                    majority_leaf_only,
+                    cache_cheap_subproblems
                 );
             },
             py::arg("X"),
@@ -96,7 +101,9 @@ PYBIND11_MODULE(_core, m) {
             py::arg("use_multipass") = true,
             py::arg("rule_list_mode") = false,
             py::arg("oracle_style") = 0,
-            py::arg("majority_leaf_only") = false
+            py::arg("majority_leaf_only") = false,
+            py::arg("cache_cheap_subproblems") = false,
+            py::arg("greedy_split_mode") = 1
         )
 
         .def("count_trees",

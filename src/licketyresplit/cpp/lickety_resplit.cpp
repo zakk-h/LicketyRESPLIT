@@ -354,6 +354,8 @@ private:
     bool use_multipass = true; // sim
     bool rule_list_mode = false;
     bool majority_leaf_only = false;
+    bool cache_cheap_subproblems = false;
+    int greedy_split_mode = 1;
 
     int oracle_style = 0; // 0=constant k (current), 1=cyclic, 2=cyclic-consistent
     std::vector<int> k_at_depth; // size depth_budget (only used for style 2)
@@ -412,6 +414,8 @@ public:
     void set_use_multipass(bool on) { use_multipass = on; }
     void set_rule_list_mode(bool on) { rule_list_mode = on; }
     void set_majority_leaf_only(bool on) { majority_leaf_only = on; }
+    void set_cache_cheap_subproblems(bool on) { cache_cheap_subproblems = on; }
+    void set_greedy_split_mode(int m) { greedy_split_mode = m; }
 
     void fit(const std::vector<std::vector<bool>>& X_col_major,
              const std::vector<int>& y,
@@ -423,7 +427,8 @@ public:
              bool use_multipass_flag,
              bool rule_list_mode_flag,
              int oracle_style_in,
-             bool majority_leaf_only_flag) {
+             bool majority_leaf_only_flag,
+             bool cache_cheap_subproblems_flag) {
         n_features = (int)X_col_major.size();
         n_samples  = (int)X_col_major[0].size();
         n_words = (n_samples + 63) / 64; // 64 -> 1, 65 -> 2
@@ -433,6 +438,7 @@ public:
         use_multipass = use_multipass_flag;
         rule_list_mode = rule_list_mode_flag;
         majority_leaf_only = majority_leaf_only_flag;
+        cache_cheap_subproblems = cache_cheap_subproblems_flag;
 
         X_bits.assign(n_features, Packed(n_words)); // length n_features with entries of Packed, initialized to all 0s bits, we will set below.
         for (int f = 0; f < n_features; ++f) {
@@ -511,7 +517,7 @@ public:
         if (n_samples == 0) return {};
 
         const std::size_t n_features = X_row_major[0].size();
-        if (static_cast<int>(n_features) != n_features) {
+        if ((int)n_features != this->n_features) {
             throw std::runtime_error("Prediction X has different number of features than training.");
         }
 
@@ -872,6 +878,9 @@ private:
     }
 
     int train_greedy(const Packed& mask, int depth_budget) {
+        if (depth_budget == 1 && (greedy_split_mode == 1 || greedy_split_mode == 2)) {
+            return depth1_exact_solver_cached(mask); 
+        }
         const uint64_t k = key_of_mask(mask);
         K2 key{k, depth_budget};
         if (auto it = greedy_cache.find(key); it != greedy_cache.end()) return it->second;
@@ -885,17 +894,28 @@ private:
         const int leaf_loss = lamN + min(pos, n_sub - pos);
 
         if (depth_budget <= 0 || leaf_loss <= 2 * lamN) {
-            greedy_cache.emplace(key, leaf_loss);
+            if (cache_cheap_subproblems) greedy_cache.emplace(key, leaf_loss);
             return leaf_loss;
         }
+
+        // decide which split-selection heuristic to use
+        bool use_entropy;
+        if (greedy_split_mode == 0) {
+            use_entropy = true;                  // always entropy-driven
+        } else if (greedy_split_mode == 1) {
+            use_entropy = (depth_budget != 1);   // special depth==1 solver
+        } else { // greedy_split_mode == 2
+            use_entropy = false;                 // always minimize child leaf objective
+        }
+
 
         // choose split via entropy gain
-        int best_feat = find_best_split(mask);
-        if (best_feat < 0) { // this should also never happen
-            greedy_cache.emplace(key, leaf_loss);
+        int best_feat = find_best_split(mask, use_entropy);
+        if (best_feat < 0) {
+            greedy_cache.emplace(key, leaf_loss); // this should also never happen
             return leaf_loss;
         }
-
+        
         Packed L(n_words), R(n_words);
         and_bits(mask, X_bits[best_feat], L);
         andnot_bits(mask, X_bits[best_feat], R);
@@ -923,9 +943,124 @@ private:
         return (k > 1) ? (k - 1) : lookahead_init;
     }
 
+    int depth1_exact_solver_cached(const Packed& mask) {
+        const uint64_t kmask = key_of_mask(mask);
+        constexpr int DEPTH = 1;
+        constexpr int KTAG  = 0;
+
+        int cached;
+        if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
+
+        const int n_sub = count_total(mask);
+        if (n_sub == 0) {
+            return 0;
+        }
+
+        const int pos = count_pos(mask);
+        const int leaf_loss = lamN + std::min(pos, n_sub - pos);
+
+        // only cache cheap subproblems if flag enabled
+        if (leaf_loss <= 2 * lamN) {
+            maybe_cache_lickety_(kmask, DEPTH, KTAG, leaf_loss,
+                                /*allow_cache=*/cache_cheap_subproblems);
+            return leaf_loss;
+        }
+
+        int best_sum = std::numeric_limits<int>::max();
+
+        Packed L(n_words), R(n_words);
+        for (int f = 0; f < n_features; ++f) {
+            and_bits(mask, X_bits[f], L);
+            andnot_bits(mask, X_bits[f], R);
+            if (!L.any() || !R.any()) continue;
+
+            const int sum = leaf_objective(L) + leaf_objective(R);
+            if (sum < best_sum) best_sum = sum;
+        }
+
+        int ans = leaf_loss;
+        if (best_sum != std::numeric_limits<int>::max()) ans = std::min(ans, best_sum);
+
+        maybe_cache_lickety_(kmask, DEPTH, KTAG, ans, /*allow_cache=*/true);
+        return ans;
+    }
+
+
+    int depth2_special_solver_cached(const Packed& mask) {
+        const uint64_t kmask = key_of_mask(mask);
+        constexpr int DEPTH = 2;
+        constexpr int KTAG  = 1;
+
+        int cached;
+        if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
+
+        const int n_sub = count_total(mask);
+        if (n_sub == 0) {
+            return 0;
+        }
+
+        const int pos = count_pos(mask);
+        const int leaf_loss = lamN + std::min(pos, n_sub - pos);
+
+        if (leaf_loss <= 2 * lamN) {
+            maybe_cache_lickety_(kmask, DEPTH, KTAG, leaf_loss,
+                                /*allow_cache=*/cache_cheap_subproblems);
+            return leaf_loss;
+        }
+
+        int best_sum = std::numeric_limits<int>::max();
+
+        Packed L(n_words), R(n_words);
+        for (int f = 0; f < n_features; ++f) {
+            and_bits(mask, X_bits[f], L);
+            andnot_bits(mask, X_bits[f], R);
+            if (!L.any() || !R.any()) continue;
+
+            const int left_best  = depth1_exact_solver_cached(L); // depth==1 uses k=0 internally
+            const int right_best = depth1_exact_solver_cached(R);
+            const int sum = left_best + right_best;
+
+            if (sum < best_sum) best_sum = sum;
+        }
+
+        int ans = leaf_loss;
+        if (best_sum != std::numeric_limits<int>::max()) ans = std::min(ans, best_sum);
+
+        maybe_cache_lickety_(kmask, DEPTH, KTAG, ans, /*allow_cache=*/true);
+        return ans;
+    }
+
+    inline void maybe_cache_lickety_(uint64_t kmask, int depth_budget, int k, int val, bool allow_cache) {
+        if (!allow_cache) return;
+        const bool use_kla = use_kla_cache();
+        if (use_kla) lickety_cache_kla.emplace(KLA{kmask, depth_budget, k}, val);
+        else         lickety_cache_k2.emplace(K2 {kmask, depth_budget},     val);
+    }
+
+    inline bool try_get_lickety_cached_(uint64_t kmask, int depth_budget, int k, int& out_val) const {
+        const bool use_kla = use_kla_cache();
+        if (use_kla) {
+            auto it = lickety_cache_kla.find(KLA{kmask, depth_budget, k});
+            if (it == lickety_cache_kla.end()) return false;
+            out_val = it->second;
+            return true;
+        } else {
+            auto it = lickety_cache_k2.find(K2{kmask, depth_budget});
+            if (it == lickety_cache_k2.end()) return false;
+            out_val = it->second;
+            return true;
+        }
+    }
 
     int lickety_split(const Packed& mask, int depth_budget, int k) {
-        if (k > depth_budget) k = depth_budget;
+        if (depth_budget == 0) {
+            return leaf_objective(mask);
+        }
+        if (depth_budget == 1) return depth1_exact_solver_cached(mask);
+        if (depth_budget == 2 && lookahead_init == 1) return depth2_special_solver_cached(mask);
+
+        
+        if (k > depth_budget - 1) k = depth_budget - 1;
         const uint64_t kmask = key_of_mask(mask);
         const bool use_kla = use_kla_cache();
         K2  key2{kmask, depth_budget}; // two keys but only 1 will be used
@@ -939,17 +1074,14 @@ private:
                 return it->second;
         }
 
-        if (depth_budget <= 0) {
-            int v = train_greedy(mask, 0);
-            return v;
-        }
-
         const int n_sub = count_total(mask);
         const int pos   = count_pos(mask);
         const int leaf_loss = lamN + min(pos, n_sub - pos);
         if (leaf_loss <= 2 * lamN) {
-            if (use_kla) lickety_cache_kla.emplace(keyla, leaf_loss);
-            else lickety_cache_k2.emplace(key2,  leaf_loss);
+            if (cache_cheap_subproblems) {
+                if (use_kla) lickety_cache_kla.emplace(keyla, leaf_loss);
+                else         lickety_cache_k2.emplace(key2,  leaf_loss);
+            }
             return leaf_loss;
         }
 
@@ -1001,40 +1133,64 @@ private:
         return ans;
     }
 
-
-
-    int find_best_split(const Packed& mask) const {
+    int find_best_split(const Packed& mask, bool use_entropy) const {
         const int n_sub = count_total(mask);
         if (n_sub <= 1) return -1;
 
-        const int pos_total = count_pos(mask);
-        const double p0 = (double)pos_total / (double)n_sub;
-        const double baseH = entropy(p0);
-
-        int best_f = -1;
-        double best_gain = -1e300;
-
         Packed L(n_words);
-        for (int f = 0; f < n_features; ++f) {
-            for (int i = 0; i < n_words; ++i) L.w[i] = mask.w[i] & X_bits[f].w[i];
-            L.w[n_words-1] &= tail_mask;
 
-            const int left_n = L.count();
-            const int right_n = n_sub - left_n;
-            if (left_n == 0 || right_n == 0) continue;
+        if (use_entropy) {
+            const int pos_total = count_pos(mask);
+            const double p0 = (double)pos_total / (double)n_sub;
+            const double baseH = entropy(p0);
 
-            const int left_pos  = popcount_and(L, Ypos);
-            const int right_pos = pos_total - left_pos;
+            int best_f = -1;
+            double best_gain = -1e300;
 
-            const double wl = (double)left_n  / (double)n_sub;
-            const double wr = (double)right_n / (double)n_sub;
-            const double pl = (double)left_pos  / (double)left_n;
-            const double pr = (double)right_pos / (double)right_n;
+            for (int f = 0; f < n_features; ++f) {
+                for (int i = 0; i < n_words; ++i) L.w[i] = mask.w[i] & X_bits[f].w[i];
+                L.w[n_words-1] &= tail_mask;
 
-            const double gain = baseH - (wl*entropy(pl) + wr*entropy(pr));
-            if (gain > best_gain) { best_gain = gain; best_f = f; }
+                const int left_n = L.count();
+                const int right_n = n_sub - left_n;
+                if (left_n == 0 || right_n == 0) continue;
+
+                const int left_pos  = popcount_and(L, Ypos);
+                const int right_pos = pos_total - left_pos;
+
+                const double wl = (double)left_n  / (double)n_sub;
+                const double wr = (double)right_n / (double)n_sub;
+                const double pl = (double)left_pos  / (double)left_n;
+                const double pr = (double)right_pos / (double)right_n;
+
+                const double gain = baseH - (wl*entropy(pl) + wr*entropy(pr));
+                if (gain > best_gain) { best_gain = gain; best_f = f; }
+            }
+            return best_f;
+        } else {
+            // minimize child leaf objectives: leaf_objective(L)+leaf_objective(R)
+            int best_f = -1;
+            int best_sum = std::numeric_limits<int>::max();
+
+            Packed R(n_words);
+            for (int f = 0; f < n_features; ++f) {
+                // L = mask & X_bits[f]
+                for (int i = 0; i < n_words; ++i) L.w[i] = mask.w[i] & X_bits[f].w[i];
+                L.w[n_words-1] &= tail_mask;
+
+                const int left_n = L.count();
+                const int right_n = n_sub - left_n;
+                if (left_n == 0 || right_n == 0) continue;
+
+                // R = mask & ~X_bits[f]
+                for (int i = 0; i < n_words; ++i) R.w[i] = mask.w[i] & ~X_bits[f].w[i];
+                R.w[n_words-1] &= tail_mask;
+
+                const int sum = leaf_objective(L) + leaf_objective(R);
+                if (sum < best_sum) { best_sum = sum; best_f = f; }
+            }
+            return best_f;
         }
-        return best_f;
     }
 
     shared_ptr<PredNode> get_ith_tree(uint64_t i) const {

@@ -7,18 +7,21 @@ import numpy as np
 import pandas as pd
 from licketyresplit import LicketyRESPLIT
 
-DEFAULT_CSV = "Datasets/Processed/magic_binarized.csv"
-DEFAULT_LAMBDA = 0.01
+DEFAULT_CSV = "Datasets/Processed/jasmine_binarized.csv"
+DEFAULT_LAMBDA = 0.005
 DEFAULT_DEPTH = 5
 DEFAULT_MULT = 0.01
 DEFAULT_KEYS = "hash" # {"hash","exact"}
 DEFAULT_TRIE_CACHE = False # True/False
-DEFAULT_LOOKAHEAD = 2
-DEFAULT_ORACLE_STYLE = 2
+DEFAULT_LOOKAHEAD = 1
+DEFAULT_ORACLE_STYLE = 0
 DEFAULT_MULT_SLACK = 0.0
 DEFAULT_USE_MULTIPASS = True
 DEFAULT_RULE_LIST_MODE = False
 DEFAULT_MAJORITY_LEAF_ONLY = False
+DEFAULT_CACHE_CHEAP_SUBPROBLEMS = True
+DEFAULT_GREEDY_SPLIT_MODE = 1
+
 
 
 def _peak_rss_bytes() -> int:
@@ -72,6 +75,12 @@ def main():
     p.add_argument("--majority-leaf", choices=["on", "off"],
                    default=("on" if DEFAULT_MAJORITY_LEAF_ONLY else "off"),
                    help="Only add the majority-label leaf at each node (on/off).")
+    p.add_argument("--cache-cheap", choices=["on", "off"],
+               default=("on" if DEFAULT_CACHE_CHEAP_SUBPROBLEMS else "off"),
+               help="Enable caching for cheap subproblems in greedy/lickety (on/off).")
+    p.add_argument("--greedy-split-mode", type=int, choices=[0, 1, 2], default=DEFAULT_GREEDY_SPLIT_MODE, help=("Greedy split selection mode"),
+)
+
 
     args = p.parse_args()
 
@@ -103,6 +112,8 @@ def main():
         rule_list_mode=(args.rule_list == "on"),
         oracle_style=args.oracle_style,
         majority_leaf_only=(args.majority_leaf == "on"),
+        cache_cheap_subproblems=(args.cache_cheap == "on"),
+        greedy_split_mode=args.greedy_split_mode,
     )
 
     t1 = time.perf_counter()
