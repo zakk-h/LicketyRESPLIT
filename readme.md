@@ -4,9 +4,20 @@ LicketyRESPLIT is a high-performance C++/Python library for rapidly enumerating 
 
 LicketyRESPLIT can generates millions of valid trees in seconds, orders of magnitudes faster than other approaches.
 
-Installation:
+## Installation
+
+### Requirements
+- Python 3.9 or newer
+- A C++17-capable compiler
+
+### Install from GitHub
+
 ```
 pip install "git+https://github.com/zakk-h/LicketyRESPLIT.git"
+
 ```
 
+## Example
+
 See [`examples/example.ipynb`](examples/example.ipynb) for a complete walkthrough of using LicketyRESPLIT.
+
