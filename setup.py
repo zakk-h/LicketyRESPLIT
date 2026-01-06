@@ -6,9 +6,10 @@ import pybind11
 
 class BuildExt(build_ext):
     c_opts = {
-        "msvc": ["/O2"],
+        "msvc": ["/O2", "/std:c++17"],
         "unix": ["-O3", "-DNDEBUG", "-funroll-loops"],
     }
+
 
     l_opts = {
         "msvc": [],

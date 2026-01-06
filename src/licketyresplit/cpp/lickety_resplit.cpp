@@ -12,9 +12,17 @@
 
 using namespace std;
 
-static inline int popcnt64(uint64_t x) {
-    return __builtin_popcountll(x);
-}
+#if defined(_MSC_VER)
+  #include <intrin.h>
+  static inline int popcnt64(uint64_t x) {
+      return static_cast<int>(__popcnt64(x));
+  }
+#else
+  static inline int popcnt64(uint64_t x) {
+      return __builtin_popcountll(x);
+  }
+#endif
+
 
 struct Packed {
     vector<uint64_t> w; // words (64-bit each)
