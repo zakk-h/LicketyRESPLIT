@@ -14,7 +14,10 @@ authors = [
   { name = "Hayden McTavish" },
   { name = "Cynthia Rudin" }
 ]
-dependencies = ["numpy>=1.23"]
+dependencies = [
+  "numpy>=1.23",
+  "matplotlib>=3.6"
+]
 
 [project.urls]
 Homepage = "https://github.com/zakk-h/LicketyRESPLIT"
