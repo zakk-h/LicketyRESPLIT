@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=64", "wheel", "pybind11>=2.12", "numpy>=1.23"]
+requires = ["setuptools>=64", "wheel", "pybind11>=2.13", "numpy>=1.23"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "licketyresplit"
-version = "0.0.4"
+version = "0.0.5"
 description = "Rashomon set approximation via LicketyRESPLIT"
 requires-python = ">=3.9"
 license = {text = "MIT"}
