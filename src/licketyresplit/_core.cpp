@@ -30,7 +30,8 @@ PYBIND11_MODULE(_core, m) {
                int oracle_style,
                bool majority_leaf_only,
                bool cache_cheap_subproblems,
-               int greedy_split_mode
+               int greedy_split_mode,
+               bool proxy_caching
             ) {
 
                 py::buffer_info xinfo = X.request();
@@ -60,10 +61,15 @@ PYBIND11_MODULE(_core, m) {
 
                 std::vector<int> y_vec(y_ptr, y_ptr + n_samples);
 
-                LicketyRESPLIT::KeyMode km =
-                    (key_mode_str == "exact"
-                         ? LicketyRESPLIT::KeyMode::EXACT
-                         : LicketyRESPLIT::KeyMode::HASH64);
+                LicketyRESPLIT::KeyMode km;
+                if (key_mode_str == "exact") {
+                    km = LicketyRESPLIT::KeyMode::EXACT;
+                } else if (key_mode_str == "literal" || key_mode_str == "lits" || key_mode_str == "lits_exact" || key_mode_str == "itemset") {
+                    km = LicketyRESPLIT::KeyMode::LITS_EXACT;
+                } else {
+                    km = LicketyRESPLIT::KeyMode::HASH64;
+                }
+
 
                 self.set_key_mode(km);
                 self.set_trie_cache_enabled(trie_cache_enabled);
@@ -72,6 +78,8 @@ PYBIND11_MODULE(_core, m) {
                 self.set_rule_list_mode(rule_list_mode);
                 self.set_cache_cheap_subproblems(cache_cheap_subproblems);
                 self.set_greedy_split_mode(greedy_split_mode);
+                self.set_majority_leaf_only(majority_leaf_only);
+                self.set_proxy_caching_enabled(proxy_caching);
 
                 self.fit(
                     X_col_major,
@@ -85,7 +93,8 @@ PYBIND11_MODULE(_core, m) {
                     rule_list_mode,
                     oracle_style,
                     majority_leaf_only,
-                    cache_cheap_subproblems
+                    cache_cheap_subproblems,
+                    proxy_caching
                 );
             },
             py::arg("X"),
@@ -103,7 +112,8 @@ PYBIND11_MODULE(_core, m) {
             py::arg("oracle_style") = 0,
             py::arg("majority_leaf_only") = false,
             py::arg("cache_cheap_subproblems") = false,
-            py::arg("greedy_split_mode") = 1
+            py::arg("greedy_split_mode") = 1,
+            py::arg("proxy_caching") = true 
         )
 
         .def("count_trees",

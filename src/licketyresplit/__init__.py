@@ -29,6 +29,7 @@ class LicketyRESPLIT:
         majority_leaf_only=False,
         cache_cheap_subproblems=False,
         greedy_split_mode=1,
+        proxy_caching=True,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -54,6 +55,7 @@ class LicketyRESPLIT:
             bool(majority_leaf_only),
             bool(cache_cheap_subproblems),
             int(greedy_split_mode),
+            bool(proxy_caching),
         )
 
     def count_trees(self):

@@ -9,6 +9,7 @@
 #include <string>
 #include <iostream>
 #include <stdexcept>
+#include <unordered_set>
 
 using namespace std;
 
@@ -23,6 +24,8 @@ using namespace std;
   }
 #endif
 
+using Lit = uint16_t; // 16-bit literal = 2*feat + sign
+using PathKey = std::vector<Lit>;
 
 struct Packed {
     vector<uint64_t> w; // words (64-bit each)
@@ -62,19 +65,44 @@ static inline uint64_t hash_mask64(const uint64_t* w, int n_words, uint64_t tail
     return h;
 }
 
+// 2*feat + sign
+static inline Lit enc_lit(int feat, int sign01) {
+    // requires feat <= 32767 so that (feat<<1 | sign) fits in 16 bits
+    return (Lit)((feat << 1) | (sign01 & 1));
+}
+
+static inline const PathKey& empty_pk() {
+    static const PathKey k;
+    return k;
+}
+
+// insert literal into PathKey, maintaining sorted canonical order
+static inline void pk_insert_sorted(PathKey& pk, Lit lit) {
+    auto it = std::lower_bound(pk.begin(), pk.end(), lit);
+    pk.insert(it, lit);
+}
+
+// remove literal from PathKey (must exist)
+static inline void pk_erase_sorted(PathKey& pk, Lit lit) {
+    auto it = std::lower_bound(pk.begin(), pk.end(), lit);
+    pk.erase(it);
+}
+
+
 // used for exact, non-probabilistic keyks at the expense of more memory. we intern the exact bytes of a mask/bitvector and assign a small integer ID.
 // first unique mask id 0, second unique mask id 1 and so on.
 class MaskIdTable {
 public:
     uint32_t intern(const Packed& mask, int n_words, uint64_t tail_mask) {
-        const size_t bytes = (size_t)n_words * sizeof(uint64_t); // constant across the dataset, how many words needed * 64 byte length
+        const size_t bytes = (size_t)n_words * sizeof(uint64_t); // constant across the dataset, how many words needed * 64 bit length
         string key;
         key.resize(bytes);
-        uint64_t* out = reinterpret_cast<uint64_t*>(&key[0]); // pointer to the start of key
+        // uint64_t* out = reinterpret_cast<uint64_t*>(&key[0]); // pointer to the start of key
         for (int i = 0; i < n_words; ++i) {
             uint64_t x = mask.w[i];
             if (i == n_words - 1) x &= tail_mask; // the last word may have padding bits, tail_mask zeroes out the unused bits.
-            out[i] = x; // the byte representation of mask.w - we need to convert to use as a key in the unordered map
+            // out[i] = x; // the byte representation of mask.w - we need to convert to use as a key in the unordered map
+            std::memcpy(&key[i * sizeof(uint64_t)], &x, sizeof(uint64_t));
         }
         auto it = table.find(key); // have we seen this bitmask before?
         if (it != table.end()) return it->second; // return the previously assigned id if it points to the entry, meaning we have it already
@@ -89,6 +117,30 @@ private:
     unordered_map<string, uint32_t> table;
     size_t pool_size = 0;
 };
+
+class LitIdTable {
+public:
+    uint32_t intern(const std::vector<Lit>& lits) {
+        const size_t bytes = lits.size() * sizeof(Lit);
+        std::string key;
+        key.resize(bytes);
+        if (bytes) std::memcpy(&key[0], lits.data(), bytes);
+
+        auto it = table.find(key);
+        if (it != table.end()) return it->second;
+        uint32_t id = (uint32_t)pool_size++;
+        table.emplace(std::move(key), id);
+        return id;
+    }
+
+
+    size_t size() const { return pool_size; }
+
+private:
+    std::unordered_map<std::string, uint32_t> table;
+    size_t pool_size = 0;
+};
+
 
 // two structures to define the key type used in hash maps
 // K2: for greedy and lickety cache (subproblem, depth)
@@ -337,7 +389,7 @@ struct PredNode {
 
 class LicketyRESPLIT {
 public:
-    enum class KeyMode { HASH64, EXACT };
+    enum class KeyMode { HASH64, EXACT, LITS_EXACT };
 
 private:
     int n_samples = 0;
@@ -356,7 +408,9 @@ private:
 
     KeyMode key_mode = KeyMode::HASH64; // will change later in fit
     bool trie_cache_enabled = true;
+    bool proxy_caching_enabled = true;
     MaskIdTable mask_ids; // used only if in exact mode
+    LitIdTable lit_ids; // for itemset mode
 
     int lookahead_init = 1; // will be changed later
     bool use_multipass = true; // sim
@@ -365,7 +419,8 @@ private:
     bool cache_cheap_subproblems = false;
     int greedy_split_mode = 1;
 
-    int oracle_style = 0; // 0=constant k (current), 1=cyclic, 2=cyclic-consistent
+    
+    int oracle_style = 0; // 0=constant k (current), 1=cyclic, 2=cyclic-consistent, 3=split
     std::vector<int> k_at_depth; // size depth_budget (only used for style 2)
 
     unordered_map<K2, int, K2::Hash> greedy_cache;
@@ -394,12 +449,34 @@ private:
     }
 
     inline uint64_t key_of_mask(const Packed& mask) {
-        if (key_mode == KeyMode::HASH64) {
-            return hash_mask64(mask.w.data(), n_words, tail_mask);
+        if (key_mode == KeyMode::LITS_EXACT) {
+            throw std::runtime_error("key_of_mask called in LITS_EXACT mode; use key_of_state(mask, pk)");
+        }
+        return key_of_state(mask, empty_pk());
+    }
+
+
+
+    inline uint64_t key_of_state(const Packed& mask, const PathKey& pk) {
+        switch (key_mode) {
+            case KeyMode::HASH64:
+                return hash_mask64(mask.w.data(), n_words, tail_mask);
+            case KeyMode::EXACT:
+                return (uint64_t)mask_ids.intern(mask, n_words, tail_mask); // cast 32->64
+            case KeyMode::LITS_EXACT:
+                return (uint64_t)lit_ids.intern(pk);
+        }
+        return 0;
+    }
+
+    inline uint64_t key_of_subproblem(const Packed& mask, const PathKey& pk) {
+        if (key_mode == KeyMode::LITS_EXACT) {
+            return key_of_state(mask, pk); // interns pk
         } else {
-            return (uint64_t)mask_ids.intern(mask, n_words, tail_mask); // cast 32->64
+            return key_of_mask(mask); 
         }
     }
+
 
     inline bool use_kla_cache() const { return lookahead_init > 1; }
     
@@ -411,6 +488,34 @@ private:
         p = max(eps, min(1.0 - eps, p));
         return -(p * log2(p) + (1.0 - p) * log2(1.0 - p));
     }
+
+    // count the distinct subproblems/bitvectors/literals/fingerprints, not considering depth or greedy/lickety
+    size_t count_distinct_subproblems_union() const {
+        std::unordered_set<uint64_t> seen;
+
+        const size_t lsz = use_kla_cache() ? lickety_cache_kla.size() : lickety_cache_k2.size();
+        const size_t approx = greedy_cache.size() + lsz;
+        seen.reserve(approx * 2 + 16);
+
+        // greedy: key is (k, depth). we ignore depth by inserting only k.
+        for (const auto& kv : greedy_cache) {
+            seen.insert(kv.first.k);
+        }
+
+        // lickety: either (k, depth) or (k, depth, la). ignore depth/la by inserting only k.
+        if (use_kla_cache()) {
+            for (const auto& kv : lickety_cache_kla) {
+                seen.insert(kv.first.k);
+            }
+        } else {
+            for (const auto& kv : lickety_cache_k2) {
+                seen.insert(kv.first.k);
+            }
+        }
+
+        return seen.size();
+    }
+
     
 
 public:
@@ -424,6 +529,7 @@ public:
     void set_majority_leaf_only(bool on) { majority_leaf_only = on; }
     void set_cache_cheap_subproblems(bool on) { cache_cheap_subproblems = on; }
     void set_greedy_split_mode(int m) { greedy_split_mode = m; }
+    void set_proxy_caching_enabled(bool on) { proxy_caching_enabled = on; }
 
     void fit(const std::vector<std::vector<bool>>& X_col_major,
              const std::vector<int>& y,
@@ -436,7 +542,8 @@ public:
              bool rule_list_mode_flag,
              int oracle_style_in,
              bool majority_leaf_only_flag,
-             bool cache_cheap_subproblems_flag) {
+             bool cache_cheap_subproblems_flag,
+             bool proxy_caching_flag) {
         n_features = (int)X_col_major.size();
         n_samples  = (int)X_col_major[0].size();
         n_words = (n_samples + 63) / 64; // 64 -> 1, 65 -> 2
@@ -447,6 +554,8 @@ public:
         rule_list_mode = rule_list_mode_flag;
         majority_leaf_only = majority_leaf_only_flag;
         cache_cheap_subproblems = cache_cheap_subproblems_flag;
+        oracle_style = oracle_style_in;
+        proxy_caching_enabled = proxy_caching_flag;
 
         X_bits.assign(n_features, Packed(n_words)); // length n_features with entries of Packed, initialized to all 0s bits, we will set below.
         for (int f = 0; f < n_features; ++f) {
@@ -467,16 +576,18 @@ public:
         for (int i = 0; i < n_words-1; ++i) root.w[i] = ~0ULL; // not 0, so all 1.
         root.w[n_words-1] = tail_mask; // enforce 0s for out of scope
 
+        const PathKey& root_pk = empty_pk();
+
         if (root_budget >= 0) {
             // user-specified bound: skip reference solution
             obj_bound = root_budget;
             std::cout << "Objective bound (user-set): " << obj_bound << "\n";
 
         } else {
-            if (lookahead_init <= 0) { // set based on greedy even if our oracle is a leaf
-                best_objective = train_greedy(root, depth_budget);
+            if (lookahead_init <= 0) { // set based on greedy even if our proxy is a leaf
+                best_objective = train_greedy(root, depth_budget, root_pk);
             } else {
-                best_objective = lickety_split(root, depth_budget, lookahead_init);
+                best_objective = lickety_split(root, depth_budget, lookahead_init, root_pk);
             }
             cout << "Best objective: " << best_objective
                 << " (" << (double)best_objective / (double)n_samples << ")\n";
@@ -485,8 +596,6 @@ public:
 
             cout << "Objective bound: " << obj_bound << "\n";
         }
-
-        oracle_style = oracle_style_in;
 
         if (oracle_style == 2) { // we define to be depth_budget+1 size but depth 0 doesn't actually matter
             k_at_depth.assign(depth_budget + 1, 1);
@@ -501,16 +610,20 @@ public:
         }
 
 
-        result = construct_trie(root, depth_budget, obj_bound);
+        result = construct_trie(root, depth_budget, obj_bound, root_pk);
 
         // cout << "Found " << result->count_trees() << " trees\n"; // we'll let the user compute this query if they want it because it is somewhat expensive
         cout << "Minimum objective: " << result->min_objective << "\n";
         cout << "Cache sizes - Greedy: " << greedy_cache.size()
             << ", Lickety: " << (use_kla_cache() ? lickety_cache_kla.size() : lickety_cache_k2.size())
             << ", Trie: " << trie_cache.size();
-        if (key_mode == KeyMode::EXACT) {
-            cout << ", Unique masks: " << mask_ids.size();
-        }
+        // cout << ", Distinct subproblems (greedy U lickety): " << count_distinct_subproblems_union();
+        // if (key_mode == KeyMode::EXACT) {
+        //     cout << ", Unique masks: " << mask_ids.size();
+        // }
+        // if (key_mode == KeyMode::LITS_EXACT) {
+        //     cout << ", Unique literal subproblems: " << lit_ids.size();
+        // }
         cout << ", Trie cache: " << (trie_cache_enabled ? "ON" : "OFF");
         cout << "\n";
     }
@@ -608,10 +721,14 @@ public:
     }
 
     // (depth_from_root, frontier_sum_obj) for each internal node of a specific materialized tree
+    // may be incompatible with certain subproblem ids (legacy)
     std::vector<std::pair<int,int>>
     get_tree_frontier_scores(uint64_t tree_index, int depth_budget) {
         if (!result) {
             throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+        }
+        if (key_mode == KeyMode::LITS_EXACT) {
+            throw std::runtime_error("frontier scoring not supported in LITS_EXACT");
         }
 
         auto tree = get_ith_tree(tree_index);
@@ -646,12 +763,13 @@ public:
         for (int i = 0; i < n_words - 1; ++i) root.w[i] = ~0ULL;
         root.w[n_words - 1] = tail_mask;
 
-        return lickety_split(root, depth_budget, /*k=*/1);
+        PathKey root_pk;
+        return lickety_split(root, depth_budget, /*k=*/1, root_pk);
     }
 
 private:
-    shared_ptr<TreeTrieNode> construct_trie(const Packed& mask, int depth, int budget) {
-        const uint64_t k = key_of_mask(mask);
+    shared_ptr<TreeTrieNode> construct_trie(const Packed& mask, int depth, int budget, const PathKey& pk) {
+        const uint64_t k = key_of_subproblem(mask, pk);
         K3 key{k, depth, budget};
 
         if (trie_cache_enabled) {
@@ -717,16 +835,32 @@ private:
 
             if (!L.any() || !R.any()) continue;
 
+            // build child pks (canonical sorted)
+            // pk refs default to EMPTY
+            const PathKey* pkLp = &empty_pk();
+            const PathKey* pkRp = &empty_pk();
+
+            // only build PKs in LITS_EXACT
+            PathKey pkL_local, pkR_local;
+            if (key_mode == KeyMode::LITS_EXACT) {
+                pkL_local = pk;
+                pkR_local = pk;
+                pk_insert_sorted(pkL_local, enc_lit(f, 1));
+                pk_insert_sorted(pkR_local, enc_lit(f, 0));
+                pkLp = &pkL_local;
+                pkRp = &pkR_local;
+            }
+
             int lossL, lossR;
             if (lookahead_init < 0) {
                 lossL = leaf_objective(L);
                 lossR = leaf_objective(R);
             } else if (lookahead_init == 0) {
-                lossL = train_greedy(L, depth - 1);
-                lossR = train_greedy(R, depth - 1);
+                lossL = train_greedy(L, depth - 1, *pkLp);
+                lossR = train_greedy(R, depth - 1, *pkRp);
             } else {
-                lossL = lickety_split(L, depth - 1, k_here);
-                lossR = lickety_split(R, depth - 1, k_here);
+                lossL = lickety_split(L, depth - 1, k_here, *pkLp);
+                lossR = lickety_split(R, depth - 1, k_here, *pkRp);
             }
             if (!rule_list_mode) {
                 if (lossL + lossR > budget) continue; // approximation decision tree rashomon set
@@ -736,11 +870,11 @@ private:
 
             std::pair<std::shared_ptr<TreeTrieNode>, std::shared_ptr<TreeTrieNode>> LR; 
             if (rule_list_mode) {
-                LR = rule_list_alloc(lossL, lossR, L, R, budget, depth);
-            } else if (use_multipass) { // while loop until converges
-                LR = multipass_long(lossL, lossR, L, R, budget, depth);
+                LR = rule_list_alloc(lossL, lossR, L, R, budget, depth, *pkLp, *pkRp);
+            } else if (use_multipass) {
+                LR = multipass_long(lossL, lossR, L, R, budget, depth, *pkLp, *pkRp);
             } else {
-                LR = singlepass_alloc(lossL, lossR, L, R, budget, depth);
+                LR = singlepass_alloc(lossL, lossR, L, R, budget, depth, *pkLp, *pkRp);
             }
             if (!LR.first || !LR.second) continue; // safeguard, especially needed if we allow non-injective keys
 
@@ -754,17 +888,18 @@ private:
     // returns left and righ treetrienode. the left and right mask are constants, even as you recurse on construct_trie
     pair<shared_ptr<TreeTrieNode>, shared_ptr<TreeTrieNode>>
     multipass_long(int loss_l, int loss_r,
-                   const Packed& Lmask, const Packed& Rmask,
-                   int budget, int depth) {
+               const Packed& Lmask, const Packed& Rmask,
+               int budget, int depth,
+               const PathKey& pkL, const PathKey& pkR) {
         int left_budget  = budget - loss_r;
         shared_ptr<TreeTrieNode> left_node =
-            (left_budget >= 0) ? construct_trie(Lmask, depth - 1, left_budget)
+            (left_budget >= 0) ? construct_trie(Lmask, depth - 1, left_budget, pkL)
                                : nullptr; // handles some potential issues with non-injective keys
         int min_left = (left_node ? left_node->min_objective : numeric_limits<int>::max());
 
         int right_budget = (min_left == numeric_limits<int>::max()) ? -1 : (budget - min_left);
         shared_ptr<TreeTrieNode> right_node =
-            (right_budget >= 0) ? construct_trie(Rmask, depth - 1, right_budget)
+            (right_budget >= 0) ? construct_trie(Rmask, depth - 1, right_budget, pkR)
                                 : nullptr;
         int min_right = (right_node ? right_node->min_objective : numeric_limits<int>::max());
 
@@ -775,7 +910,7 @@ private:
             if (new_left_budget > left_budget) {
                 left_budget = new_left_budget;
                 if (left_budget >= 0) {
-                    left_node = construct_trie(Lmask, depth - 1, left_budget);
+                    left_node = construct_trie(Lmask, depth - 1, left_budget, pkL);
                     int new_min_left = left_node->min_objective;
                     if (new_min_left < min_left) min_left = new_min_left;
                 }
@@ -785,7 +920,7 @@ private:
             if (new_right_budget > right_budget) {
                 right_budget = new_right_budget;
                 if (right_budget >= 0) {
-                    right_node = construct_trie(Rmask, depth - 1, right_budget);
+                    right_node = construct_trie(Rmask, depth - 1, right_budget, pkR);
                     int new_min_right = right_node->min_objective;
                     if (new_min_right < min_right) { min_right = new_min_right; improved = true; }
                 }
@@ -799,8 +934,10 @@ private:
 
     // this is solely for ableation study purposes - if practical we would subtract minobjective from the other side
     std::pair<std::shared_ptr<TreeTrieNode>, std::shared_ptr<TreeTrieNode>>
-    singlepass_alloc(int loss_l, int loss_r, const Packed& Lmask, const Packed& Rmask,
-                     int budget, int depth) {
+    singlepass_alloc(int loss_l, int loss_r,
+                 const Packed& Lmask, const Packed& Rmask,
+                 int budget, int depth,
+                 const PathKey& pkL, const PathKey& pkR) {
         int left_budget  = budget - loss_r;
         int right_budget = budget - loss_l;
 
@@ -808,10 +945,10 @@ private:
         std::shared_ptr<TreeTrieNode> right_node = nullptr;
 
         if (left_budget >= 0) { // robustness incase we change pruning
-            left_node = construct_trie(Lmask, depth - 1, left_budget);
+            left_node = construct_trie(Lmask, depth - 1, left_budget, pkL);
         }
         if (right_budget >= 0) {
-            right_node = construct_trie(Rmask, depth - 1, right_budget);
+            right_node = construct_trie(Rmask, depth - 1, right_budget, pkR);
         }
 
         return {left_node, right_node};
@@ -819,8 +956,10 @@ private:
     }
 
     std::pair<std::shared_ptr<TreeTrieNode>, std::shared_ptr<TreeTrieNode>>
-    rule_list_alloc(int loss_l, int loss_r, const Packed& Lmask, const Packed& Rmask,
-                    int budget, int depth) {
+    rule_list_alloc(int loss_l, int loss_r,
+                const Packed& Lmask, const Packed& Rmask,
+                int budget, int depth,
+                const PathKey& pkL, const PathKey& pkR) {
         using std::shared_ptr;
         const int INF = std::numeric_limits<int>::max();
 
@@ -852,24 +991,24 @@ private:
         if (solve_left_first) {
             int left_budget = left_candidate;
             if (left_budget >= 0) {
-                left_node = construct_trie(Lmask, depth - 1, left_budget);
+                left_node = construct_trie(Lmask, depth - 1, left_budget, pkL);
                 int min_left = left_node ? left_node->min_objective : INF;
 
                 // remaining budget for the right side is B - min_left to be more optimal than assuming leaf loss on left
                 int right_budget = (min_left == INF) ? -1 : (budget - min_left);
                 if (right_budget >= 0) {
-                    right_node = construct_trie(Rmask, depth - 1, right_budget);
+                    right_node = construct_trie(Rmask, depth - 1, right_budget, pkR);
                 }
             }
         } else {
             int right_budget = right_candidate;
             if (right_budget >= 0) {
-                right_node = construct_trie(Rmask, depth - 1, right_budget);
+                right_node = construct_trie(Rmask, depth - 1, right_budget, pkR);
                 int min_right = right_node ? right_node->min_objective : INF;
 
                 int left_budget = (min_right == INF) ? -1 : (budget - min_right);
                 if (left_budget >= 0) {
-                    left_node = construct_trie(Lmask, depth - 1, left_budget);
+                    left_node = construct_trie(Lmask, depth - 1, left_budget, pkL);
                 }
             }
         }
@@ -885,13 +1024,46 @@ private:
         return lamN + min(pos, n_sub - pos);
     }
 
-    int train_greedy(const Packed& mask, int depth_budget) {
-        if (depth_budget == 1 && (greedy_split_mode == 1 || greedy_split_mode == 2)) {
-            return depth1_exact_solver_cached(mask); 
+    inline void make_child_pks_if_needed_(
+        int feat,
+        const PathKey& pk,
+        const PathKey*& pkLp,
+        const PathKey*& pkRp,
+        PathKey& pkL_local,
+        PathKey& pkR_local
+    ) const {
+        pkLp = &empty_pk();
+        pkRp = &empty_pk();
+        if (key_mode == KeyMode::LITS_EXACT) {
+            pkL_local = pk;
+            pkR_local = pk;
+            pk_insert_sorted(pkL_local, enc_lit(feat, 1));
+            pk_insert_sorted(pkR_local, enc_lit(feat, 0));
+            pkLp = &pkL_local;
+            pkRp = &pkR_local;
         }
-        const uint64_t k = key_of_mask(mask);
-        K2 key{k, depth_budget};
-        if (auto it = greedy_cache.find(key); it != greedy_cache.end()) return it->second;
+    }
+
+
+    int train_greedy(const Packed& mask, int depth_budget, const PathKey& pk) {
+        if (depth_budget == 0) {
+            return leaf_objective(mask);
+        }
+        if (depth_budget == 1 && (greedy_split_mode == 1 || greedy_split_mode == 2)) {
+            return depth1_exact_solver_cached(mask, pk); 
+        }
+        // const uint64_t k = key_of_subproblem(mask, pk);
+        // K2 key{k, depth_budget};
+        // if (auto it = greedy_cache.find(key); it != greedy_cache.end()) return it->second;
+        uint64_t kmask = 0;
+        K2 key{0, depth_budget};
+
+        if (proxy_caching_enabled) {
+            kmask = key_of_subproblem(mask, pk);
+            key.k = kmask;
+            if (auto it = greedy_cache.find(key); it != greedy_cache.end()) return it->second;
+        }
+
 
         const int n_sub = count_total(mask);
         if (n_sub == 0) {
@@ -901,8 +1073,9 @@ private:
         const int pos = count_pos(mask);
         const int leaf_loss = lamN + min(pos, n_sub - pos);
 
-        if (depth_budget <= 0 || leaf_loss <= 2 * lamN) {
-            if (cache_cheap_subproblems) greedy_cache.emplace(key, leaf_loss);
+        if (leaf_loss <= 2 * lamN) {
+            if (cache_cheap_subproblems && proxy_caching_enabled) 
+                greedy_cache.emplace(key, leaf_loss);
             return leaf_loss;
         }
 
@@ -920,7 +1093,7 @@ private:
         // choose split via entropy gain
         int best_feat = find_best_split(mask, use_entropy);
         if (best_feat < 0) {
-            greedy_cache.emplace(key, leaf_loss); // this should also never happen
+            if (proxy_caching_enabled) greedy_cache.emplace(key, leaf_loss); // this should also never happen
             return leaf_loss;
         }
         
@@ -928,36 +1101,53 @@ private:
         and_bits(mask, X_bits[best_feat], L);
         andnot_bits(mask, X_bits[best_feat], R);
         if (!L.any() || !R.any()) { // this should also never happen if no error is thrown with find best split
-            greedy_cache.emplace(key, leaf_loss);
             return leaf_loss;
         }
 
-        int left_obj  = train_greedy(L, depth_budget - 1);
-        int right_obj = train_greedy(R, depth_budget - 1);
+        const PathKey* pkLp = &empty_pk();
+        const PathKey* pkRp = &empty_pk();
+        PathKey pkL_local, pkR_local;
+        make_child_pks_if_needed_(best_feat, pk, pkLp, pkRp, pkL_local, pkR_local);
+
+        int left_obj  = train_greedy(L, depth_budget - 1, *pkLp);
+        int right_obj = train_greedy(R, depth_budget - 1, *pkRp);
         int split_obj = left_obj + right_obj;
 
         int ans = min(leaf_loss, split_obj);
-        greedy_cache.emplace(key, ans);
+        if (proxy_caching_enabled) greedy_cache.emplace(key, ans);
         return ans;
     }
 
-    int eval_with_lookahead(const Packed& m, int depth, int k) {
-            if (k <= 0) return train_greedy(m, depth);
-            return lickety_split(m, depth, k);
+    int eval_with_lookahead(const Packed& m, int depth, int k, const PathKey& pk) {
+        if (k <= 0) return train_greedy(m, depth, pk);
+        return lickety_split(m, depth, k, pk);
     }
+
 
     inline int next_k_cycle(int k) const {
         // cycle: ... 3->2->1->K->K-1->...
         return (k > 1) ? (k - 1) : lookahead_init;
     }
 
-    int depth1_exact_solver_cached(const Packed& mask) {
-        const uint64_t kmask = key_of_mask(mask);
+    int depth1_exact_solver_cached(const Packed& mask, const PathKey& pk) {
+        // const uint64_t kmask = key_of_subproblem(mask, pk);
+        // constexpr int DEPTH = 1;
+        // constexpr int KTAG  = 0;
+
+        // int cached;
+        // if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
+
         constexpr int DEPTH = 1;
         constexpr int KTAG  = 0;
 
+        uint64_t kmask = 0;
         int cached;
-        if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
+
+        if (proxy_caching_enabled) {
+            kmask = key_of_subproblem(mask, pk);
+            if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
+        }
+
 
         const int n_sub = count_total(mask);
         if (n_sub == 0) {
@@ -969,8 +1159,9 @@ private:
 
         // only cache cheap subproblems if flag enabled
         if (leaf_loss <= 2 * lamN) {
-            maybe_cache_lickety_(kmask, DEPTH, KTAG, leaf_loss,
-                                /*allow_cache=*/cache_cheap_subproblems);
+            if (proxy_caching_enabled) {
+                maybe_cache_lickety_(kmask, DEPTH, KTAG, leaf_loss,/*allow_cache=*/cache_cheap_subproblems);
+            }
             return leaf_loss;
         }
 
@@ -989,18 +1180,30 @@ private:
         int ans = leaf_loss;
         if (best_sum != std::numeric_limits<int>::max()) ans = std::min(ans, best_sum);
 
-        maybe_cache_lickety_(kmask, DEPTH, KTAG, ans, /*allow_cache=*/true);
+        if (proxy_caching_enabled) maybe_cache_lickety_(kmask, DEPTH, KTAG, ans, /*allow_cache=*/true);
         return ans;
     }
 
 
-    int depth2_special_solver_cached(const Packed& mask) {
-        const uint64_t kmask = key_of_mask(mask);
+    int depth2_special_solver_cached(const Packed& mask, const PathKey& pk){
+        // const uint64_t kmask = key_of_subproblem(mask, pk);
+        // constexpr int DEPTH = 2;
+        // constexpr int KTAG  = 1;
+
+        // int cached;
+        // if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
+
         constexpr int DEPTH = 2;
         constexpr int KTAG  = 1;
 
+        uint64_t kmask = 0;
         int cached;
-        if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
+
+        if (proxy_caching_enabled) {
+            kmask = key_of_subproblem(mask, pk);
+            if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
+        }
+
 
         const int n_sub = count_total(mask);
         if (n_sub == 0) {
@@ -1011,8 +1214,9 @@ private:
         const int leaf_loss = lamN + std::min(pos, n_sub - pos);
 
         if (leaf_loss <= 2 * lamN) {
-            maybe_cache_lickety_(kmask, DEPTH, KTAG, leaf_loss,
-                                /*allow_cache=*/cache_cheap_subproblems);
+            if (proxy_caching_enabled) {
+                maybe_cache_lickety_(kmask, DEPTH, KTAG, leaf_loss,/*allow_cache=*/cache_cheap_subproblems);
+            }
             return leaf_loss;
         }
 
@@ -1024,8 +1228,13 @@ private:
             andnot_bits(mask, X_bits[f], R);
             if (!L.any() || !R.any()) continue;
 
-            const int left_best  = depth1_exact_solver_cached(L); // depth==1 uses k=0 internally
-            const int right_best = depth1_exact_solver_cached(R);
+            const PathKey* pkLp = &empty_pk();
+            const PathKey* pkRp = &empty_pk();
+            PathKey pkL_local, pkR_local;
+            make_child_pks_if_needed_(f, pk, pkLp, pkRp, pkL_local, pkR_local);
+
+            const int left_best  = depth1_exact_solver_cached(L, *pkLp); // depth==1 uses k=0 internally
+            const int right_best = depth1_exact_solver_cached(R, *pkRp);
             const int sum = left_best + right_best;
 
             if (sum < best_sum) best_sum = sum;
@@ -1034,9 +1243,76 @@ private:
         int ans = leaf_loss;
         if (best_sum != std::numeric_limits<int>::max()) ans = std::min(ans, best_sum);
 
-        maybe_cache_lickety_(kmask, DEPTH, KTAG, ans, /*allow_cache=*/true);
+        if (proxy_caching_enabled) maybe_cache_lickety_(kmask, DEPTH, KTAG, ans, /*allow_cache=*/true);
         return ans;
     }
+
+    int depthd_exact_solver_cached(const Packed& mask, int depth_budget, const PathKey& pk) {
+        if (depth_budget <= 0) return leaf_objective(mask);
+        if (depth_budget == 1) return depth1_exact_solver_cached(mask, pk);
+        if (depth_budget == 2) return depth2_special_solver_cached(mask, pk);
+
+        // const uint64_t kmask = key_of_subproblem(mask, pk);
+        // const int KTAG = depth_budget - 1; // generalization of exact depth 2, this is where we would store it.
+
+        // int cached;
+        // if (try_get_lickety_cached_(kmask, depth_budget, KTAG, cached)) return cached;
+
+        const int DEPTH = depth_budget;
+        const int KTAG  = depth_budget - 1;
+
+
+        uint64_t kmask = 0;
+        int cached;
+
+        if (proxy_caching_enabled) {
+            kmask = key_of_subproblem(mask, pk);
+            if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
+        }
+
+
+        const int n_sub = count_total(mask);
+        if (n_sub == 0) {
+            return 0;
+        }
+
+        const int pos = count_pos(mask);
+        const int leaf_loss = lamN + std::min(pos, n_sub - pos);
+
+        if (leaf_loss <= 2 * lamN) {
+            if (proxy_caching_enabled) {
+                maybe_cache_lickety_(kmask, DEPTH, KTAG, leaf_loss,/*allow_cache=*/cache_cheap_subproblems);
+            }
+            return leaf_loss;
+        }
+
+        int best_sum = std::numeric_limits<int>::max();
+
+        Packed L(n_words), R(n_words);
+        for (int f = 0; f < n_features; ++f) {
+            and_bits(mask, X_bits[f], L);
+            andnot_bits(mask, X_bits[f], R);
+            if (!L.any() || !R.any()) continue;
+
+            const PathKey* pkLp = &empty_pk();
+            const PathKey* pkRp = &empty_pk();
+            PathKey pkL_local, pkR_local;
+            make_child_pks_if_needed_(f, pk, pkLp, pkRp, pkL_local, pkR_local);
+
+            const int left_best  = depthd_exact_solver_cached(L, depth_budget - 1, *pkLp);
+            const int right_best = depthd_exact_solver_cached(R, depth_budget - 1, *pkRp);
+
+            const int sum = left_best + right_best;
+            if (sum < best_sum) best_sum = sum;
+        }
+
+        int ans = leaf_loss;
+        if (best_sum != std::numeric_limits<int>::max()) ans = std::min(ans, best_sum);
+
+        if (proxy_caching_enabled) maybe_cache_lickety_(kmask, depth_budget, KTAG, ans, /*allow_cache=*/true);
+        return ans;
+    }
+
 
     inline void maybe_cache_lickety_(uint64_t kmask, int depth_budget, int k, int val, bool allow_cache) {
         if (!allow_cache) return;
@@ -1060,33 +1336,59 @@ private:
         }
     }
 
-    int lickety_split(const Packed& mask, int depth_budget, int k) {
+    int lickety_split(const Packed& mask, int depth_budget, int k, const PathKey& pk) {
         if (depth_budget == 0) {
             return leaf_objective(mask);
         }
-        if (depth_budget == 1) return depth1_exact_solver_cached(mask);
-        if (depth_budget == 2 && lookahead_init == 1) return depth2_special_solver_cached(mask);
+        if (depth_budget == 1) return depth1_exact_solver_cached(mask, pk);
+
+        if (k > depth_budget - 1) k = depth_budget - 1;
+
+        if (depth_budget == 2 && k == 1) return depth2_special_solver_cached(mask, pk);
+        if (k == depth_budget - 1) {
+            return depthd_exact_solver_cached(mask, depth_budget, pk);
+        }
 
         
-        if (k > depth_budget - 1) k = depth_budget - 1;
-        const uint64_t kmask = key_of_mask(mask);
-        const bool use_kla = use_kla_cache();
-        K2  key2{kmask, depth_budget}; // two keys but only 1 will be used
-        KLA keyla{kmask, depth_budget, k};
+        // const uint64_t kmask = key_of_subproblem(mask, pk);
+        // const bool use_kla = use_kla_cache();
+        // K2  key2{kmask, depth_budget}; // two keys but only 1 will be used
+        // KLA keyla{kmask, depth_budget, k};
 
-        if (use_kla) {
-            if (auto it = lickety_cache_kla.find(keyla); it != lickety_cache_kla.end())
-                return it->second;
-        } else {
-            if (auto it = lickety_cache_k2.find(key2); it != lickety_cache_k2.end())
-                return it->second;
+        // if (use_kla) {
+        //     if (auto it = lickety_cache_kla.find(keyla); it != lickety_cache_kla.end())
+        //         return it->second;
+        // } else {
+        //     if (auto it = lickety_cache_k2.find(key2); it != lickety_cache_k2.end())
+        //         return it->second;
+        // }
+
+        uint64_t kmask = 0;
+        K2  key2{0, depth_budget};
+        KLA keyla{0, depth_budget, k};
+
+        const bool use_kla = use_kla_cache();
+
+        if (proxy_caching_enabled) {
+            kmask = key_of_subproblem(mask, pk);
+            key2.k = kmask;
+            keyla.k = kmask;
+
+            if (use_kla) {
+                if (auto it = lickety_cache_kla.find(keyla); it != lickety_cache_kla.end())
+                    return it->second;
+            } else {
+                if (auto it = lickety_cache_k2.find(key2); it != lickety_cache_k2.end())
+                    return it->second;
+            }
         }
+
 
         const int n_sub = count_total(mask);
         const int pos   = count_pos(mask);
         const int leaf_loss = lamN + min(pos, n_sub - pos);
         if (leaf_loss <= 2 * lamN) {
-            if (cache_cheap_subproblems) {
+            if (cache_cheap_subproblems && proxy_caching_enabled) {
                 if (use_kla) lickety_cache_kla.emplace(keyla, leaf_loss);
                 else         lickety_cache_k2.emplace(key2,  leaf_loss);
             }
@@ -1104,8 +1406,13 @@ private:
             andnot_bits(mask, X_bits[f], R);
             if (!L.any() || !R.any()) continue;
 
+            const PathKey* pkLp = &empty_pk();
+            const PathKey* pkRp = &empty_pk();
+            PathKey pkL_local, pkR_local;
+            make_child_pks_if_needed_(f, pk, pkLp, pkRp, pkL_local, pkR_local);
+
             //int sum = train_greedy(L, depth_budget - 1) + train_greedy(R, depth_budget - 1);
-            const int sum = eval_with_lookahead(L, depth_budget - 1, child_k) + eval_with_lookahead(R, depth_budget - 1, child_k);
+            const int sum = eval_with_lookahead(L, depth_budget - 1, child_k, *pkLp) + eval_with_lookahead(R, depth_budget - 1, child_k, *pkRp);
             if (sum < best_sum) {
                 best_sum = sum;
                 best_feat = f;
@@ -1124,20 +1431,46 @@ private:
         // }
         int k_recurse;
         if (oracle_style == 0) {
-                k_recurse = k; // constant
+            // style 0: constant k (recursively choosing based on lower tier LicketySPLIT)
+            k_recurse = k;
+        } else if (oracle_style == 3) {
+            // style 3: decrement by 1; when it hits 0, switch to greedy tail (SPLIT)
+            k_recurse = child_k; // child_k = k - 1 (already computed above)
         } else {
-            k_recurse = (child_k == 0) ? lookahead_init : child_k; // restart when 0
+            // styles 1/2: restart when it hits (recursively applying SPLIT)
+            k_recurse = (child_k == 0) ? lookahead_init : child_k;
         }
 
 
         int ans = leaf_loss; 
         if (best_feat >= 0) {
-            const int left_loss  = lickety_split(bestL, depth_budget - 1, k_recurse);
-            const int right_loss = lickety_split(bestR, depth_budget - 1, k_recurse);
-            ans = min(ans, left_loss + right_loss); // do lickety even if leaf is better over greedy and see which is preferred
+            const int next_depth = depth_budget - 1;
+
+            int left_loss, right_loss;
+
+            const PathKey* pkLp = &empty_pk();
+            const PathKey* pkRp = &empty_pk();
+            PathKey pkL_local, pkR_local;
+            make_child_pks_if_needed_(best_feat, pk, pkLp, pkRp, pkL_local, pkR_local);
+
+            if (oracle_style == 3 && k_recurse <= 0) {
+                // greedy tail once k runs out
+                left_loss  = train_greedy(bestL, next_depth, *pkLp);
+                right_loss = train_greedy(bestR, next_depth, *pkRp);
+            } else {
+                // normal lickety recursion (k might be <=0 for other oracle styles, but fine here)
+                left_loss  = lickety_split(bestL, next_depth, k_recurse, *pkLp);
+                right_loss = lickety_split(bestR, next_depth, k_recurse, *pkRp);
+            }
+
+            ans = std::min(ans, left_loss + right_loss); // do lickety even if leaf is better over greedy and see which is preferred
+
         }
-        if (use_kla) lickety_cache_kla.emplace(keyla, ans);
-        else lickety_cache_k2.emplace(key2,  ans);
+        if (proxy_caching_enabled) {
+            if (use_kla) lickety_cache_kla.emplace(keyla, ans);
+            else lickety_cache_k2.emplace(key2,  ans);
+        }
+        
         return ans;
     }
 
@@ -1399,7 +1732,9 @@ private:
         K2 key{km, depth_remaining};
         auto [it, inserted] = seen.insert(key);
         if (!inserted) return;
-        running_sum += lickety_split(mask, depth_remaining, 1);
+        PathKey empty_pk; // does not correctly use pk, don't do frontier with literal
+        running_sum += lickety_split(mask, depth_remaining, 1, empty_pk);
+
     }
 
     struct SibEntry {
