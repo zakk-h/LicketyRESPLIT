@@ -387,6 +387,20 @@ struct PredNode {
     shared_ptr<PredNode> right;
 };
 
+// for joint rashomon set prediction / rid
+struct ObjBucket {
+    int obj;
+    std::vector<Packed> preds; // each is a prediction bitvector for one tree at this obj. predictions for all trees with an objective.
+};
+
+struct EvalCtx {
+    int n_eval = 0;
+    int n_words = 0;
+    uint64_t tail_mask = ~0ULL;
+    std::vector<Packed> X_bits_eval; // everything needed for evaluation dataset
+};
+
+
 class LicketyRESPLIT {
 public:
     enum class KeyMode { HASH64, EXACT, LITS_EXACT };
@@ -407,7 +421,7 @@ private:
     Packed Ypos; // each bit of a word is the label for the row
 
     KeyMode key_mode = KeyMode::HASH64; // will change later in fit
-    bool trie_cache_enabled = true;
+    bool trie_cache_enabled = false;
     bool proxy_caching_enabled = true;
     MaskIdTable mask_ids; // used only if in exact mode
     LitIdTable lit_ids; // for itemset mode
@@ -418,6 +432,7 @@ private:
     bool majority_leaf_only = false;
     bool cache_cheap_subproblems = false;
     int greedy_split_mode = 1;
+    int num_proxy_features = -1; // <=0 means use all feature. positive for feature selection
 
     
     int oracle_style = 0; // 0=constant k (current), 1=cyclic, 2=cyclic-consistent, 3=split
@@ -475,6 +490,10 @@ private:
         } else {
             return key_of_mask(mask); 
         }
+    }
+
+    inline int proxy_feat_count_() const {
+        return (num_proxy_features > 0) ? std::min(num_proxy_features, n_features) : n_features;
     }
 
 
@@ -543,7 +562,9 @@ public:
              int oracle_style_in,
              bool majority_leaf_only_flag,
              bool cache_cheap_subproblems_flag,
-             bool proxy_caching_flag) {
+             bool proxy_caching_flag,
+             int num_proxy_features_in
+            ) {
         n_features = (int)X_col_major.size();
         n_samples  = (int)X_col_major[0].size();
         n_words = (n_samples + 63) / 64; // 64 -> 1, 65 -> 2
@@ -556,6 +577,8 @@ public:
         cache_cheap_subproblems = cache_cheap_subproblems_flag;
         oracle_style = oracle_style_in;
         proxy_caching_enabled = proxy_caching_flag;
+        if (num_proxy_features_in <= 0) num_proxy_features = n_features;
+        else num_proxy_features = std::min(num_proxy_features_in, n_features);
 
         X_bits.assign(n_features, Packed(n_words)); // length n_features with entries of Packed, initialized to all 0s bits, we will set below.
         for (int f = 0; f < n_features; ++f) {
@@ -995,7 +1018,8 @@ private:
                 int min_left = left_node ? left_node->min_objective : INF;
 
                 // remaining budget for the right side is B - min_left to be more optimal than assuming leaf loss on left
-                int right_budget = (min_left == INF) ? -1 : (budget - min_left);
+                //int right_budget = (min_left == INF) ? -1 : (budget - min_left);
+                int right_budget = (loss_l == INF) ? -1 : (budget - loss_l);
                 if (right_budget >= 0) {
                     right_node = construct_trie(Rmask, depth - 1, right_budget, pkR);
                 }
@@ -1006,7 +1030,8 @@ private:
                 right_node = construct_trie(Rmask, depth - 1, right_budget, pkR);
                 int min_right = right_node ? right_node->min_objective : INF;
 
-                int left_budget = (min_right == INF) ? -1 : (budget - min_right);
+                //int left_budget = (min_right == INF) ? -1 : (budget - min_right);
+                int left_budget = (loss_r == INF) ? -1 : (budget - loss_r);
                 if (left_budget >= 0) {
                     left_node = construct_trie(Lmask, depth - 1, left_budget, pkL);
                 }
@@ -1168,7 +1193,8 @@ private:
         int best_sum = std::numeric_limits<int>::max();
 
         Packed L(n_words), R(n_words);
-        for (int f = 0; f < n_features; ++f) {
+        const int F = proxy_feat_count_();
+        for (int f = 0; f < F; ++f) {
             and_bits(mask, X_bits[f], L);
             andnot_bits(mask, X_bits[f], R);
             if (!L.any() || !R.any()) continue;
@@ -1223,7 +1249,8 @@ private:
         int best_sum = std::numeric_limits<int>::max();
 
         Packed L(n_words), R(n_words);
-        for (int f = 0; f < n_features; ++f) {
+        const int F = proxy_feat_count_();
+        for (int f = 0; f < F; ++f) {
             and_bits(mask, X_bits[f], L);
             andnot_bits(mask, X_bits[f], R);
             if (!L.any() || !R.any()) continue;
@@ -1289,7 +1316,8 @@ private:
         int best_sum = std::numeric_limits<int>::max();
 
         Packed L(n_words), R(n_words);
-        for (int f = 0; f < n_features; ++f) {
+        const int F = proxy_feat_count_();
+        for (int f = 0; f < F; ++f) {
             and_bits(mask, X_bits[f], L);
             andnot_bits(mask, X_bits[f], R);
             if (!L.any() || !R.any()) continue;
@@ -1401,7 +1429,8 @@ private:
         Packed L(n_words), R(n_words), bestL(n_words), bestR(n_words);
 
         const int child_k = k - 1;
-        for (int f = 0; f < n_features; ++f) {
+        const int F = proxy_feat_count_();
+        for (int f = 0; f < F; ++f) {
             and_bits(mask, X_bits[f], L);
             andnot_bits(mask, X_bits[f], R);
             if (!L.any() || !R.any()) continue;
@@ -1488,7 +1517,8 @@ private:
             int best_f = -1;
             double best_gain = -1e300;
 
-            for (int f = 0; f < n_features; ++f) {
+            const int F = proxy_feat_count_();
+            for (int f = 0; f < F; ++f) {
                 for (int i = 0; i < n_words; ++i) L.w[i] = mask.w[i] & X_bits[f].w[i];
                 L.w[n_words-1] &= tail_mask;
 
@@ -1514,7 +1544,8 @@ private:
             int best_sum = std::numeric_limits<int>::max();
 
             Packed R(n_words);
-            for (int f = 0; f < n_features; ++f) {
+            const int F = proxy_feat_count_();
+            for (int f = 0; f < F; ++f) {
                 // L = mask & X_bits[f]
                 for (int i = 0; i < n_words; ++i) L.w[i] = mask.w[i] & X_bits[f].w[i];
                 L.w[n_words-1] &= tail_mask;
@@ -1795,9 +1826,265 @@ private:
         }
     }
 
+// whole trie prediction for RID
 
-
+struct PredPackWithObj {
+    int obj;     // training objective (lamN*leaves + miscls)
+    Packed pred1; // bitset over the evaluation dataset rows: 1 iff prediction == 1
 };
+
+private:
+    static inline void and_bits_eval(const Packed& a, const Packed& b, Packed& out, int n_words, uint64_t tail_mask) {
+        for (int i = 0; i < n_words; ++i) out.w[i] = a.w[i] & b.w[i];
+        out.w[n_words - 1] &= tail_mask;
+    }
+
+    static inline void andnot_bits_eval(const Packed& a, const Packed& b, Packed& out, int n_words, uint64_t tail_mask) {
+        for (int i = 0; i < n_words; ++i) out.w[i] = a.w[i] & ~b.w[i];
+        out.w[n_words - 1] &= tail_mask;
+    }
+
+    static inline void or_bits_eval(const Packed& a, const Packed& b, Packed& out, int n_words, uint64_t tail_mask) {
+        for (int i = 0; i < n_words; ++i) out.w[i] = a.w[i] | b.w[i];
+        out.w[n_words - 1] &= tail_mask;
+    }
+
+    static inline bool any_eval(const Packed& a) {
+        for (uint64_t t : a.w) if (t) return true;
+        return false;
+    }
+
+    static inline void clear_eval(Packed& a) {
+        std::fill(a.w.begin(), a.w.end(), 0ULL);
+    }
+
+    static inline Packed zeros_eval(int n_words) {
+        return Packed((size_t)n_words); // ctor zeros words
+    }
+
+    static inline Packed copy_eval_mask(const Packed& m, int n_words, uint64_t tail_mask) {
+        Packed out((size_t)n_words);
+        out.w = m.w; // vector copy
+        out.w[n_words - 1] &= tail_mask;
+        return out;
+    }
+
+    // build packed feature columns for EVAL X (row-major uint8 because predictions per row lend themselves to row major)
+    static inline EvalCtx build_eval_ctx_(const std::vector<std::vector<uint8_t>>& X_row_major, int n_features_expected) {
+        EvalCtx ctx;
+
+        ctx.n_eval = (int)X_row_major.size();
+        if (ctx.n_eval == 0) {
+            ctx.n_words = 0;
+            ctx.tail_mask = ~0ULL;
+            return ctx;
+        }
+
+        const int d = (int)X_row_major[0].size();
+        if (d != n_features_expected) {
+            throw std::runtime_error("Eval X has different number of features than training.");
+        }
+
+        ctx.n_words = (ctx.n_eval + 63) / 64;
+        ctx.tail_mask = (ctx.n_eval % 64) ? ((1ULL << (ctx.n_eval % 64)) - 1ULL) : ~0ULL;
+
+        ctx.X_bits_eval.assign((size_t)d, Packed((size_t)ctx.n_words));
+
+        for (int f = 0; f < d; ++f) {
+            Packed &col = ctx.X_bits_eval[f];
+            clear_eval(col);
+            for (int i = 0; i < ctx.n_eval; ++i) {
+                if (X_row_major[(size_t)i][(size_t)f]) {
+                    col.w[(size_t)(i >> 6)] |= (1ULL << (i & 63));
+                }
+            }
+            col.w[(size_t)(ctx.n_words - 1)] &= ctx.tail_mask;
+        }
+
+        return ctx;
+    }
+
+    // all 1s bitvector (for the evaluation passed in dataset not train)
+    static inline Packed eval_root_mask_(int n_words, uint64_t tail_mask) {
+        Packed m((size_t)n_words);
+        if (n_words == 0) return m;
+        for (int i = 0; i < n_words - 1; ++i) m.w[(size_t)i] = ~0ULL;
+        m.w[(size_t)(n_words - 1)] = tail_mask;
+        return m;
+    }
+
+    // convert unordered_map<int, vector<Packed>> -> sorted vector<ObjBucket>
+    // before, map objective to lists of predictions
+    // after conversion, it is a list of objective-bucket objects, each of which stores the list of predictions for all trees with that objective
+    static inline std::vector<ObjBucket> to_sorted_buckets_(
+        std::unordered_map<int, std::vector<Packed>>& acc
+    ) {
+        std::vector<ObjBucket> out;
+        out.reserve(acc.size());
+        for (auto &kv : acc) {
+            ObjBucket b;
+            b.obj = kv.first;
+            b.preds = std::move(kv.second);
+            out.push_back(std::move(b));
+        }
+        std::sort(out.begin(), out.end(), [](const ObjBucket& a, const ObjBucket& b){ return a.obj < b.obj; });
+        return out;
+    }
+
+    // core recursion: returns buckets of predictions grouped by objective for ALL trees rooted at node with obj <= budget.
+    std::vector<ObjBucket> collect_preds_by_obj_(
+        const TreeTrieNode* node,
+        int budget,
+        const Packed& eval_mask, // does not decrease size, just gets sparser
+        const EvalCtx& ctx
+    ) const {
+        if (!node) return {};
+        if (budget < 0) return {};
+
+        if (node->min_objective == std::numeric_limits<int>::max()) return {};
+        if (node->min_objective > budget) return {};
+
+        // accumulate as obj (training) -> list of preds on evaluation (Packed)
+        std::unordered_map<int, std::vector<Packed>> acc;
+        // heuristic reserve
+        const int max_objs = budget - node->min_objective + 1;
+        acc.reserve((size_t)std::max(1, max_objs));
+
+        // leaves at this node
+        for (const auto& leaf : node->leaves) {
+            if (leaf.loss > budget) continue;
+
+            Packed p((size_t)ctx.n_words);
+            if (ctx.n_words > 0) {
+                if (leaf.prediction == 1) {
+                    p.w = eval_mask.w; // pred=1 on this subset
+                    p.w[(size_t)(ctx.n_words - 1)] &= ctx.tail_mask;
+                } else {
+                    // pred=0 -> all zeros
+                    clear_eval(p);
+                }
+            }
+
+            acc[leaf.loss].push_back(std::move(p)); // storing the predictions in the map with that objective.
+        }
+
+        // splits
+        const int INF = std::numeric_limits<int>::max();
+
+        for (const auto& split : node->splits) {
+            const TreeTrieNode* L = split.left.get();
+            const TreeTrieNode* R = split.right.get();
+            if (!L || !R) continue;
+
+            const int minL = L->min_objective;
+            const int minR = R->min_objective;
+            if (minL == INF || minR == INF) continue;
+
+            // cap child budgets using the other side's min objective so everything found will pair with exactly one subtree on the other side
+            int bL = budget - minR;
+            int bR = budget - minL;
+            if (bL < 0 || bR < 0) continue;
+
+            // also cap by the budgets actually used to build those trie nodes. should never change anything.
+            bL = std::min(bL, L->budget);
+            bR = std::min(bR, R->budget);
+
+            // evaluation dataset routing masks
+            Packed Lmask((size_t)ctx.n_words), Rmask((size_t)ctx.n_words);
+            if (ctx.n_words > 0) {
+                and_bits_eval(eval_mask, ctx.X_bits_eval[(size_t)split.feature], Lmask, ctx.n_words, ctx.tail_mask);
+                andnot_bits_eval(eval_mask, ctx.X_bits_eval[(size_t)split.feature], Rmask, ctx.n_words, ctx.tail_mask);
+            }
+
+            // recurse
+            auto Lb = collect_preds_by_obj_(L, bL, Lmask, ctx); // these return sorted lists of objective bucket objects
+            auto Rb = collect_preds_by_obj_(R, bR, Rmask, ctx);
+            if (Lb.empty() || Rb.empty()) continue;
+
+            // for filtering by <= budget, both Lb and Rb are sorted by obj.
+            // we'll two-pointer for each left obj to find all right objs <= (budget - l_obj).
+            size_t r_hi = 0; // exclusive upper bound index in Rb
+            for (size_t li = 0; li < Lb.size(); ++li) {
+                const int lo = Lb[li].obj; // smallest objective initially
+                if (lo > budget) break;
+                const int rem = budget - lo; // how far do we have to look
+
+                while (r_hi < Rb.size() && Rb[r_hi].obj <= rem) ++r_hi; // never look past the remainder because RHS is also sorted
+                if (r_hi == 0) continue; // no right objs fit
+
+                // cross product (filtered)
+                for (size_t ri = 0; ri < r_hi; ++ri) { // r_hi is one past the last valid
+                    const int ro = Rb[ri].obj;
+                    const int tot = lo + ro;
+
+                    // combine each left pred with each right pred (disjoint masks so OR is correct)
+                    const auto& Lpreds = Lb[li].preds;
+                    const auto& Rpreds = Rb[ri].preds;
+
+                    // reserve some space in this objective bucket to reduce reallocs
+                    auto &dest = acc[tot];
+                    // rough reserve: only if currently empty
+                    if (dest.empty()) {
+                            dest.reserve(std::max(Lpreds.size(), Rpreds.size()));
+                        }
+
+
+                    for (const auto& lp : Lpreds) {
+                        for (const auto& rp : Rpreds) {
+                            Packed comb((size_t)ctx.n_words);
+                            if (ctx.n_words > 0) {
+                                // comb = lp | rp
+                                for (int w = 0; w < ctx.n_words; ++w) {
+                                    comb.w[(size_t)w] = lp.w[(size_t)w] | rp.w[(size_t)w]; // OR, combining where 1. 0s will stay 0 which is fine. if they were predicted 0 they'll never change, if they are not set yet they'll change eventually.
+                                }
+                                comb.w[(size_t)(ctx.n_words - 1)] &= ctx.tail_mask;
+                            }
+                            dest.push_back(std::move(comb));
+                        }
+                    }
+                }
+            }
+        }
+
+        return to_sorted_buckets_(acc);
+    }
+
+public:
+    // main entry: enumerate ALL valid trees under the trie root (or budget_override if >=0),
+    // returning (training_objective, prediction vector on evaluation dataset) for each tree.
+    // NOTE: this can be extremely large in memory if the Rashomon set is huge.
+    std::vector<PredPackWithObj> get_all_predictions_packed_trie(const std::vector<std::vector<uint8_t>>& X_row_major, int budget_override = -1) const {
+        if (!result) {
+            throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+        }
+
+        EvalCtx ctx = build_eval_ctx_(X_row_major, this->n_features);
+
+        // decide budget
+        int budget = (budget_override >= 0) ? budget_override : result->budget;
+
+        // root eval mask = all eval rows
+        Packed root_mask = eval_root_mask_(ctx.n_words, ctx.tail_mask);
+
+        // collect grouped by objective
+        auto buckets = collect_preds_by_obj_(result.get(), budget, root_mask, ctx);
+
+        // flatten
+        std::vector<PredPackWithObj> out;
+        // compute total count for reserve
+        size_t total = 0;
+        for (const auto& b : buckets) total += b.preds.size();
+        out.reserve(total);
+
+        for (auto &b : buckets) {
+            for (auto &p : b.preds) {
+                out.push_back(PredPackWithObj{b.obj, std::move(p)});
+            }
+        }
+        return out;
+    }
+};
+
 
 // extern "C" {
 //     LicketyRESPLIT* create_model() {

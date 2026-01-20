@@ -2,9 +2,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, Circle
 from matplotlib.lines import Line2D
-from ._core import LicketyRESPLIT as _LicketyCore
+# from ._core import LicketyRESPLIT as _LicketyCore
+from ._core import LicketyRESPLIT as _LicketyCore, rid_subtractive_model_reliance as _rid_subtractive_core
 
-__all__ = ["LicketyRESPLIT"]
+# __all__ = ["LicketyRESPLIT"]
+__all__ = ["LicketyRESPLIT", "rid_subtractive_model_reliance"]
+
+def rid_subtractive_model_reliance(X, y, n_boot=10, lambda_reg=0.01, depth_budget=5, rashomon_mult=0.03, lookahead_k=1, seed=0, memory_efficient=False, binning_map=None):
+    X = np.asarray(X, dtype=np.uint8)
+    y = np.asarray(y, dtype=int)
+    return _rid_subtractive_core(X, y, int(n_boot), float(lambda_reg), int(depth_budget), float(rashomon_mult), int(lookahead_k), int(seed), bool(memory_efficient), binning_map)
+
 
 class LicketyRESPLIT:
     def __init__(self):
@@ -30,6 +38,7 @@ class LicketyRESPLIT:
         cache_cheap_subproblems=False,
         greedy_split_mode=1,
         proxy_caching=True,
+        num_proxy_features=0
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -56,6 +65,7 @@ class LicketyRESPLIT:
             bool(cache_cheap_subproblems),
             int(greedy_split_mode),
             bool(proxy_caching),
+            int(num_proxy_features),
         )
 
     def count_trees(self):

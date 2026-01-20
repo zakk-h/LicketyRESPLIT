@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 
 #include "cpp/lickety_resplit.cpp"
+#include "cpp/rid.cpp"
 
 namespace py = pybind11;
 
@@ -31,7 +32,8 @@ PYBIND11_MODULE(_core, m) {
                bool majority_leaf_only,
                bool cache_cheap_subproblems,
                int greedy_split_mode,
-               bool proxy_caching
+               bool proxy_caching,
+               int num_proxy_features
             ) {
 
                 py::buffer_info xinfo = X.request();
@@ -94,7 +96,8 @@ PYBIND11_MODULE(_core, m) {
                     oracle_style,
                     majority_leaf_only,
                     cache_cheap_subproblems,
-                    proxy_caching
+                    proxy_caching,
+                    num_proxy_features
                 );
             },
             py::arg("X"),
@@ -113,7 +116,8 @@ PYBIND11_MODULE(_core, m) {
             py::arg("majority_leaf_only") = false,
             py::arg("cache_cheap_subproblems") = false,
             py::arg("greedy_split_mode") = 1,
-            py::arg("proxy_caching") = true 
+            py::arg("proxy_caching") = true,
+            py::arg("num_proxy_features") = 0
         )
 
         .def("count_trees",
@@ -292,6 +296,95 @@ PYBIND11_MODULE(_core, m) {
             },
             py::arg("depth_budget")
         );
+
+    m.def(
+        "rid_subtractive_model_reliance",
+        [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X,
+        py::array_t<int,     py::array::c_style | py::array::forcecast> y,
+        int n_boot,
+        double lambda_reg,
+        int depth_budget,
+        double rashomon_mult,
+        int lookahead_k,
+        std::uint64_t seed,
+        bool memory_efficient,
+        py::object binning_map_obj ) {
+            py::buffer_info xinfo = X.request();
+            py::buffer_info yinfo = y.request();
+
+            if (xinfo.ndim != 2) throw std::runtime_error("X must be 2D");
+            if (yinfo.ndim != 1) throw std::runtime_error("y must be 1D");
+
+            int n_samples  = (int)xinfo.shape[0];
+            int n_features = (int)xinfo.shape[1];
+            if ((int)yinfo.shape[0] != n_samples) throw std::runtime_error("y must match X rows");
+
+            auto *x_ptr = static_cast<uint8_t*>(xinfo.ptr);
+            auto *y_ptr = static_cast<int*>(yinfo.ptr);
+
+            // build row-major X
+            std::vector<std::vector<uint8_t>> X_row_major(n_samples, std::vector<uint8_t>(n_features));
+            for (int i = 0; i < n_samples; ++i) {
+                std::memcpy(X_row_major[i].data(),
+                            x_ptr + (std::size_t)i * (std::size_t)n_features,
+                            (std::size_t)n_features * sizeof(uint8_t));
+            }
+
+            std::vector<int> y_vec(y_ptr, y_ptr + n_samples);   
+            
+            // binning map stuff
+            int d = n_features;
+            std::vector<std::vector<int>> groups;
+            if (binning_map_obj.is_none()) {
+                groups.resize(d);
+                for (int j = 0; j < d; ++j) groups[j] = {j};
+            } else {
+                py::dict bm = binning_map_obj.cast<py::dict>();
+
+                std::vector<int> keys;
+                for (auto item : bm) keys.push_back(py::cast<int>(item.first));
+                std::sort(keys.begin(), keys.end());
+
+                groups.reserve(keys.size());
+                for (int k : keys) {
+                    py::list lst = bm[py::int_(k)].cast<py::list>();
+                    std::vector<int> cols;
+                    for (auto h : lst) cols.push_back(py::cast<int>(h));
+                    groups.push_back(std::move(cols));
+                }
+            }
+
+
+            RIDResult r = compute_rid_subtractive_mr_bootstrap(
+                X_row_major,
+                y_vec,
+                n_boot,
+                lambda_reg,
+                depth_budget,
+                rashomon_mult,
+                lookahead_k,
+                seed,
+                memory_efficient,
+                groups
+            );
+
+            py::dict out;
+            out["mean_sub_mr"] = r.mean_sub_mr; // vector<double>
+            out["cdf_x"] = r.cdf_x; // vector<vector<double>>
+            out["cdf_p"] = r.cdf_p; // vector<vector<double>>
+            return out;
+        },
+        py::arg("X"),
+        py::arg("y"),
+        py::arg("n_boot") = 10,
+        py::arg("lambda_reg") = 0.01,
+        py::arg("depth_budget") = 5,
+        py::arg("rashomon_mult") = 0.05,
+        py::arg("lookahead_k") = 1,
+        py::arg("seed") = 0,
+        py::arg("memory_efficient") = false,
+        py::arg("binning_map") = py::none()
+    );
 
 
 }
