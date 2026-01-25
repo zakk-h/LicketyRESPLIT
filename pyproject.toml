@@ -3,15 +3,16 @@ requires = ["setuptools>=64", "wheel", "pybind11>=2.13", "numpy>=1.23"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "licketyresplit"
+name = "praxis"
 version = "0.0.5"
-description = "Rashomon set approximation via LicketyRESPLIT"
+description = "Rashomon set tools via PRAXIS (includes approximation, exact calculation, and variable importance utilities)"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
   { name = "Zakk Heile" },
-  { name = "Varun Babbar" },
   { name = "Hayden McTavish" },
+  { name = "Varun Babbar" },
+  { name = "Margo Seltzer" },
   { name = "Cynthia Rudin" }
 ]
 dependencies = [

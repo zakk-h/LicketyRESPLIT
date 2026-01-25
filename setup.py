@@ -25,10 +25,9 @@ class BuildExt(build_ext):
             opts.append("-std=c++17")
             opts.append("-fPIC")
 
-        # optional fast mode via env var
-        fast = os.environ.get("LICKETY_FAST", "").lower() in ("1", "true", "yes")
+        aggressive = os.environ.get("AGGRESSIVE", "").lower() in ("1", "true", "yes")
 
-        if fast and ct == "unix":
+        if aggressive and ct == "unix":
             opts += [
                 "-march=core-avx-i",
                 "-mtune=generic",
@@ -38,9 +37,9 @@ class BuildExt(build_ext):
                 "-flto",
                 "-lm",
             ]
-            print("** Building LicketyRESPLIT in FAST mode (LICKETY_FAST=1) **")
-        elif fast and ct != "unix":
-            print("WARNING: LICKETY_FAST is set, but non-unix compiler detected; ignoring fast flags.")
+            print("** Building PRAXIS with additional flags")
+        elif aggressive and ct != "unix":
+            print("Non-unix compiler detected; using safe flags.")
 
         for ext in self.extensions:
             ext.extra_compile_args = opts
@@ -51,14 +50,14 @@ class BuildExt(build_ext):
 
 ext_modules = [
     Extension(
-        "licketyresplit._core",
+        "praxis._core",
         sources=[
-            "src/licketyresplit/_core.cpp",
-            # _core.cpp includes cpp/lickety_resplit.cpp directly
+            "src/praxis/_core.cpp",
+            # _core.cpp includes relevant things in cpp folder anyway
         ],
         include_dirs=[
             pybind11.get_include(),
-            "src/licketyresplit/cpp",
+            "src/praxis/cpp",
         ],
         language="c++",
     ),

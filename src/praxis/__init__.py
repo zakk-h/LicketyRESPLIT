@@ -2,11 +2,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, Circle
 from matplotlib.lines import Line2D
-# from ._core import LicketyRESPLIT as _LicketyCore
-from ._core import LicketyRESPLIT as _LicketyCore, rid_subtractive_model_reliance as _rid_subtractive_core
+from ._core import PRAXIS as _PRAXISCore, rid_subtractive_model_reliance as _rid_subtractive_core
 
-# __all__ = ["LicketyRESPLIT"]
-__all__ = ["LicketyRESPLIT", "rid_subtractive_model_reliance"]
+# __all__ = ["PRAXIS"]
+__all__ = ["PRAXIS", "rid_subtractive_model_reliance"]
 
 def rid_subtractive_model_reliance(X, y, n_boot=10, lambda_reg=0.01, depth_budget=5, rashomon_mult=0.03, lookahead_k=1, seed=0, memory_efficient=False, binning_map=None):
     X = np.asarray(X, dtype=np.uint8)
@@ -14,10 +13,10 @@ def rid_subtractive_model_reliance(X, y, n_boot=10, lambda_reg=0.01, depth_budge
     return _rid_subtractive_core(X, y, int(n_boot), float(lambda_reg), int(depth_budget), float(rashomon_mult), int(lookahead_k), int(seed), bool(memory_efficient), binning_map)
 
 
-class LicketyRESPLIT:
+class PRAXIS:
     def __init__(self):
-        # self._model = _core.LicketyRESPLIT()
-        self._model = _LicketyCore()
+        # self._model = _core.PRAXIS()
+        self._model = _PRAXISCore()
 
     def fit(
         self,
@@ -254,7 +253,7 @@ class LicketyRESPLIT:
         ax.set_ylim(min(ys) - 1, 1)
         ax.set_aspect("equal", adjustable="box")
         ax.set_axis_off()
-        plt.title(f"LicketyRESPLIT Tree {tree_index}")
+        plt.title(f"PRAXIS Tree {tree_index}")
         plt.show()
         
     def get_tree_frontier_scores(self, tree_index: int, depth_budget: int):

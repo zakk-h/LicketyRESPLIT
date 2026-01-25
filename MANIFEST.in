@@ -1,1 +1,1 @@
-recursive-include src/licketyresplit/cpp *.cpp *.hpp *.h
+recursive-include src/praxis/cpp *.cpp *.hpp *.h

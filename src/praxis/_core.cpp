@@ -2,20 +2,20 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "cpp/lickety_resplit.cpp"
+#include "cpp/praxis.cpp"
 #include "cpp/rid.cpp"
 
 namespace py = pybind11;
 
 PYBIND11_MODULE(_core, m) {
-    m.doc() = "LicketyRESPLIT C++ core bindings";
+    m.doc() = "PRAXIS C++ core bindings";
 
-    py::class_<LicketyRESPLIT>(m, "LicketyRESPLIT")
+    py::class_<PRAXIS>(m, "PRAXIS")
         .def(py::init<>())
 
         .def(
             "fit",
-            [](LicketyRESPLIT &self,
+            [](PRAXIS &self,
                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X,
                py::array_t<int,     py::array::c_style | py::array::forcecast> y,
                double lambda_reg,
@@ -63,13 +63,13 @@ PYBIND11_MODULE(_core, m) {
 
                 std::vector<int> y_vec(y_ptr, y_ptr + n_samples);
 
-                LicketyRESPLIT::KeyMode km;
+                PRAXIS::KeyMode km;
                 if (key_mode_str == "exact") {
-                    km = LicketyRESPLIT::KeyMode::EXACT;
+                    km = PRAXIS::KeyMode::EXACT;
                 } else if (key_mode_str == "literal" || key_mode_str == "lits" || key_mode_str == "lits_exact" || key_mode_str == "itemset") {
-                    km = LicketyRESPLIT::KeyMode::LITS_EXACT;
+                    km = PRAXIS::KeyMode::LITS_EXACT;
                 } else {
-                    km = LicketyRESPLIT::KeyMode::HASH64;
+                    km = PRAXIS::KeyMode::HASH64;
                 }
 
 
@@ -121,19 +121,19 @@ PYBIND11_MODULE(_core, m) {
         )
 
         .def("count_trees",
-             [](LicketyRESPLIT &self) {
+             [](PRAXIS &self) {
                  return self.result ? self.result->count_trees() : 0ULL;
              })
 
         .def("get_min_objective",
-             [](LicketyRESPLIT &self) {
+             [](PRAXIS &self) {
                  return self.result
                         ? self.result->min_objective
                         : std::numeric_limits<int>::max();
              })
 
         .def("get_root_histogram",
-             [](LicketyRESPLIT &self) {
+             [](PRAXIS &self) {
                  if (!self.result) {
                      return std::vector<std::pair<int, std::uint64_t>>{};
                  }
@@ -149,7 +149,7 @@ PYBIND11_MODULE(_core, m) {
 
         .def(
             "get_predictions",
-            [](const LicketyRESPLIT &self,
+            [](const PRAXIS &self,
                std::uint64_t tree_index,
                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X) {
                 py::buffer_info xinfo = X.request();
@@ -185,7 +185,7 @@ PYBIND11_MODULE(_core, m) {
 
         .def(
             "get_all_predictions",
-            [](const LicketyRESPLIT &self,
+            [](const PRAXIS &self,
                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X,
                bool stack) {
                 py::buffer_info xinfo = X.request();
@@ -242,7 +242,7 @@ PYBIND11_MODULE(_core, m) {
 
         .def(
             "get_tree_objective",
-            [](const LicketyRESPLIT &self, std::uint64_t tree_index) {
+            [](const PRAXIS &self, std::uint64_t tree_index) {
                 auto obj_pair = self.get_ith_tree_objective(tree_index);
                 // obj_pair.first  = unnormalized objective (int)
                 // obj_pair.second = normalized objective (double)
@@ -253,7 +253,7 @@ PYBIND11_MODULE(_core, m) {
 
         .def(
             "get_tree_paths",
-            [](const LicketyRESPLIT &self, std::uint64_t tree_index) {
+            [](const PRAXIS &self, std::uint64_t tree_index) {
                 auto result = self.get_tree_paths(tree_index);
                 const auto &paths = result.first;
                 const auto &preds = result.second;
@@ -281,7 +281,7 @@ PYBIND11_MODULE(_core, m) {
 
         .def(
             "get_tree_frontier_scores",
-            [](LicketyRESPLIT &self, std::uint64_t tree_index, int depth_budget) {
+            [](PRAXIS &self, std::uint64_t tree_index, int depth_budget) {
                 auto vec = self.get_tree_frontier_scores(tree_index, depth_budget);
                 return vec;
             },
@@ -291,7 +291,7 @@ PYBIND11_MODULE(_core, m) {
 
         .def(
             "root_lickety_objective_lookahead1",
-            [](LicketyRESPLIT &self, int depth_budget) {
+            [](PRAXIS &self, int depth_budget) {
                 return self.root_lickety_objective_lookahead1(depth_budget);
             },
             py::arg("depth_budget")

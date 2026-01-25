@@ -218,7 +218,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         std::vector<std::vector<bool>> Xcol;
         rowmajor_to_colmajor_bool(Xb, Xcol);
 
-        LicketyRESPLIT model;
+        PRAXIS model;
         model.fit(
             Xcol,
             yb,

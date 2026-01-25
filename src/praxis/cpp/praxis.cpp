@@ -401,7 +401,7 @@ struct EvalCtx {
 };
 
 
-class LicketyRESPLIT {
+class PRAXIS {
 public:
     enum class KeyMode { HASH64, EXACT, LITS_EXACT };
 
@@ -2087,15 +2087,15 @@ public:
 
 
 // extern "C" {
-//     LicketyRESPLIT* create_model() {
-//         return new LicketyRESPLIT();
+//     PRAXIS* create_model() {
+//         return new PRAXIS();
 //     }
 
-//     void delete_model(LicketyRESPLIT* model) {
+//     void delete_model(PRAXIS* model) {
 //         delete model;
 //     }
 
-//     void fit_model(LicketyRESPLIT* model,
+//     void fit_model(PRAXIS* model,
 //                       const uint8_t* X_data, int n_samples, int n_features,
 //                       const int* y_data,
 //                       double lambda, int depth, double rashomon_mult,
@@ -2109,35 +2109,35 @@ public:
 //             for (int i = 0; i < n_samples; ++i) X[f][i] = (col[i] != 0);
 //         }
 //         vector<int> y(y_data, y_data + n_samples);
-//         if (key_mode == 1) model->set_key_mode(LicketyRESPLIT::KeyMode::EXACT);
-//         else model->set_key_mode(LicketyRESPLIT::KeyMode::HASH64);
+//         if (key_mode == 1) model->set_key_mode(PRAXIS::KeyMode::EXACT);
+//         else model->set_key_mode(PRAXIS::KeyMode::HASH64);
 //         model->set_trie_cache_enabled(trie_cache_enabled != 0);
 //         model->set_multiplicative_slack(multiplicative_slack);
 //         model->fit(X, y, lambda, depth, rashomon_mult, lookahead_k);
 //     }
 
-//     uint64_t get_tree_count(LicketyRESPLIT* model) {
+//     uint64_t get_tree_count(PRAXIS* model) {
 //         return model->result ? model->result->count_trees() : 0ULL;
 //     }
 
-//     uint64_t count_trees_leq(LicketyRESPLIT* model, int objective) {
+//     uint64_t count_trees_leq(PRAXIS* model, int objective) {
 //         if (!model || !model->result) return 0ULL;
 //         return model->result->count_leq(objective);
 //     }
 
-//     int get_min_objective(LicketyRESPLIT* model) {
+//     int get_min_objective(PRAXIS* model) {
 //         return model->result ? model->result->min_objective : numeric_limits<int>::max();
 //     }
 
 //     // number of distinct objective values at the root node - may or may not be useful
-//     size_t get_root_hist_size(LicketyRESPLIT* model) {
+//     size_t get_root_hist_size(PRAXIS* model) {
 //         if (!model || !model->result) return 0;
 //         model->result->ensure_hist_built();
 //         return model->result->hist.size();
 //     }
 
 //     // fill caller-provided buffers with (objective, count) pairs
-//     void get_root_histogram(LicketyRESPLIT* model,
+//     void get_root_histogram(PRAXIS* model,
 //                             int* objs_out,
 //                             uint64_t* cnts_out) {
 //         if (!model || !model->result) return;
