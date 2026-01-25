@@ -10,6 +10,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <unordered_set>
+#include <cstdint>
 
 using namespace std;
 
@@ -553,9 +554,9 @@ public:
     void fit(const std::vector<std::vector<bool>>& X_col_major,
              const std::vector<int>& y,
              double lambda,
-             int depth_budget,
+             int8_t depth_budget,
              double rashomon_mult,
-             int lookahead_k,
+             int8_t lookahead_k,
              int root_budget,
              bool use_multipass_flag,
              bool rule_list_mode_flag,
@@ -791,7 +792,7 @@ public:
     }
 
 private:
-    shared_ptr<TreeTrieNode> construct_trie(const Packed& mask, int depth, int budget, const PathKey& pk) {
+    shared_ptr<TreeTrieNode> construct_trie(const Packed& mask, int8_t depth, int budget, const PathKey& pk) {
         const uint64_t k = key_of_subproblem(mask, pk);
         K3 key{k, depth, budget};
 
@@ -848,7 +849,7 @@ private:
 
         Packed L(n_words), R(n_words);
 
-        const int k_here = (oracle_style == 2 && depth >= 0 && depth < (int)k_at_depth.size())
+        const int8_t k_here = (oracle_style == 2 && depth >= 0 && depth < (int)k_at_depth.size())
             ? k_at_depth[depth-1]
             : lookahead_init;
 
@@ -912,7 +913,7 @@ private:
     pair<shared_ptr<TreeTrieNode>, shared_ptr<TreeTrieNode>>
     multipass_long(int loss_l, int loss_r,
                const Packed& Lmask, const Packed& Rmask,
-               int budget, int depth,
+               int budget, int8_t depth,
                const PathKey& pkL, const PathKey& pkR) {
         int left_budget  = budget - loss_r;
         shared_ptr<TreeTrieNode> left_node =
@@ -959,7 +960,7 @@ private:
     std::pair<std::shared_ptr<TreeTrieNode>, std::shared_ptr<TreeTrieNode>>
     singlepass_alloc(int loss_l, int loss_r,
                  const Packed& Lmask, const Packed& Rmask,
-                 int budget, int depth,
+                 int budget, int8_t depth,
                  const PathKey& pkL, const PathKey& pkR) {
         int left_budget  = budget - loss_r;
         int right_budget = budget - loss_l;
@@ -981,7 +982,7 @@ private:
     std::pair<std::shared_ptr<TreeTrieNode>, std::shared_ptr<TreeTrieNode>>
     rule_list_alloc(int loss_l, int loss_r,
                 const Packed& Lmask, const Packed& Rmask,
-                int budget, int depth,
+                int budget, int8_t depth,
                 const PathKey& pkL, const PathKey& pkR) {
         using std::shared_ptr;
         const int INF = std::numeric_limits<int>::max();
@@ -1070,7 +1071,7 @@ private:
     }
 
 
-    int train_greedy(const Packed& mask, int depth_budget, const PathKey& pk) {
+    int train_greedy(const Packed& mask, int8_t depth_budget, const PathKey& pk) {
         if (depth_budget == 0) {
             return leaf_objective(mask);
         }
@@ -1149,7 +1150,7 @@ private:
     }
 
 
-    inline int next_k_cycle(int k) const {
+    inline int next_k_cycle(int8_t k) const {
         // cycle: ... 3->2->1->K->K-1->...
         return (k > 1) ? (k - 1) : lookahead_init;
     }
@@ -1162,8 +1163,8 @@ private:
         // int cached;
         // if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
 
-        constexpr int DEPTH = 1;
-        constexpr int KTAG  = 0;
+        constexpr int8_t DEPTH = 1;
+        constexpr int8_t KTAG  = 0;
 
         uint64_t kmask = 0;
         int cached;
@@ -1219,8 +1220,8 @@ private:
         // int cached;
         // if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
 
-        constexpr int DEPTH = 2;
-        constexpr int KTAG  = 1;
+        constexpr int8_t DEPTH = 2;
+        constexpr int8_t KTAG  = 1;
 
         uint64_t kmask = 0;
         int cached;
@@ -1274,7 +1275,7 @@ private:
         return ans;
     }
 
-    int depthd_exact_solver_cached(const Packed& mask, int depth_budget, const PathKey& pk) {
+    int depthd_exact_solver_cached(const Packed& mask, int8_t depth_budget, const PathKey& pk) {
         if (depth_budget <= 0) return leaf_objective(mask);
         if (depth_budget == 1) return depth1_exact_solver_cached(mask, pk);
         if (depth_budget == 2) return depth2_special_solver_cached(mask, pk);
@@ -1285,8 +1286,8 @@ private:
         // int cached;
         // if (try_get_lickety_cached_(kmask, depth_budget, KTAG, cached)) return cached;
 
-        const int DEPTH = depth_budget;
-        const int KTAG  = depth_budget - 1;
+        const int8_t DEPTH = depth_budget;
+        const int8_t  KTAG  = depth_budget - 1;
 
 
         uint64_t kmask = 0;
@@ -1342,14 +1343,14 @@ private:
     }
 
 
-    inline void maybe_cache_lickety_(uint64_t kmask, int depth_budget, int k, int val, bool allow_cache) {
+    inline void maybe_cache_lickety_(uint64_t kmask, int8_t depth_budget, int8_t k, int val, bool allow_cache) {
         if (!allow_cache) return;
         const bool use_kla = use_kla_cache();
         if (use_kla) lickety_cache_kla.emplace(KLA{kmask, depth_budget, k}, val);
         else         lickety_cache_k2.emplace(K2 {kmask, depth_budget},     val);
     }
 
-    inline bool try_get_lickety_cached_(uint64_t kmask, int depth_budget, int k, int& out_val) const {
+    inline bool try_get_lickety_cached_(uint64_t kmask, int8_t depth_budget, int8_t k, int& out_val) const {
         const bool use_kla = use_kla_cache();
         if (use_kla) {
             auto it = lickety_cache_kla.find(KLA{kmask, depth_budget, k});
@@ -1364,7 +1365,7 @@ private:
         }
     }
 
-    int lickety_split(const Packed& mask, int depth_budget, int k, const PathKey& pk) {
+    int lickety_split(const Packed& mask, int8_t depth_budget, int8_t k, const PathKey& pk) {
         if (depth_budget == 0) {
             return leaf_objective(mask);
         }
@@ -1458,7 +1459,7 @@ private:
         //     int right_loss = lickety_split(bestR, depth_budget - 1);
         //     ans = left_loss + right_loss;
         // }
-        int k_recurse;
+        int8_t k_recurse;
         if (oracle_style == 0) {
             // style 0: constant k (recursively choosing based on lower tier LicketySPLIT)
             k_recurse = k;
