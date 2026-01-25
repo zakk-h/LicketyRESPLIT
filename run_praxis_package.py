@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from PRAXIS import PRAXIS
+from praxis import PRAXIS
 
 DEFAULT_CSV = "Datasets/Bootstrapped/aging_binarized_bootstrap_2.csv"
 DEFAULT_LAMBDA = 0.01
