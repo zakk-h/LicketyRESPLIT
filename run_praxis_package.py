@@ -5,13 +5,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from licketyresplit import LicketyRESPLIT
+from PRAXIS import PRAXIS
 
-DEFAULT_CSV = "Datasets/Processed/jasmine_binarized.csv"
-DEFAULT_LAMBDA = 0.005
+DEFAULT_CSV = "Datasets/Bootstrapped/aging_binarized_bootstrap_2.csv"
+DEFAULT_LAMBDA = 0.01
 DEFAULT_DEPTH = 5
-DEFAULT_MULT = 0.01
-DEFAULT_KEYS = "hash" # {"hash","exact"}
+DEFAULT_MULT = 0.1
+DEFAULT_KEYS = "hash" # {"hash","exact", "literal"}
 DEFAULT_TRIE_CACHE = False # True/False
 DEFAULT_LOOKAHEAD = 1
 DEFAULT_ORACLE_STYLE = 0
@@ -21,6 +21,7 @@ DEFAULT_RULE_LIST_MODE = False
 DEFAULT_MAJORITY_LEAF_ONLY = False
 DEFAULT_CACHE_CHEAP_SUBPROBLEMS = True
 DEFAULT_GREEDY_SPLIT_MODE = 1
+DEFAULT_PROXY_CACHING = False
 
 
 
@@ -43,7 +44,7 @@ def _fmt_bytes(b: int) -> str:
 
 def main():
     import argparse
-    p = argparse.ArgumentParser(description="LicketyRESPLIT (Python package)")
+    p = argparse.ArgumentParser(description="PRAXIS (Python package)")
     p.add_argument("--csv", type=str, default=DEFAULT_CSV,
                    help="Path to CSV (last col = label).")
     p.add_argument("--lambda", dest="lambda_reg", type=float,
@@ -54,7 +55,7 @@ def main():
     p.add_argument("--mult", dest="mult", type=float,
                    default=DEFAULT_MULT,
                    help="Rashomon multiplier (rashomon_mult).")
-    p.add_argument("--keys", choices=["hash", "exact"],
+    p.add_argument("--keys", choices=["hash", "exact", "literal"],
                    default=DEFAULT_KEYS,
                    help="Key mode for caching.")
     p.add_argument("--trie-cache", choices=["on", "off"],
@@ -64,7 +65,7 @@ def main():
                    help="Lookahead k (oracle strength).")
     p.add_argument("--mult-slack", type=float, default=DEFAULT_MULT_SLACK,
                    help="Multiplicative slack on Rashomon bound.")
-    p.add_argument("--oracle-style", type=int, default=DEFAULT_ORACLE_STYLE, choices=[0, 1, 2],
+    p.add_argument("--oracle-style", type=int, default=DEFAULT_ORACLE_STYLE, choices=[0, 1, 2, 3],
                    help="Oracle style (0=const, 1=cycle, 2=cycle-consistent).")
     p.add_argument("--multipass", choices=["on", "off"],
                    default=("on" if DEFAULT_USE_MULTIPASS else "off"),
@@ -78,9 +79,8 @@ def main():
     p.add_argument("--cache-cheap", choices=["on", "off"],
                default=("on" if DEFAULT_CACHE_CHEAP_SUBPROBLEMS else "off"),
                help="Enable caching for cheap subproblems in greedy/lickety (on/off).")
-    p.add_argument("--greedy-split-mode", type=int, choices=[0, 1, 2], default=DEFAULT_GREEDY_SPLIT_MODE, help=("Greedy split selection mode"),
-)
-
+    p.add_argument("--greedy-split-mode", type=int, choices=[0, 1, 2], default=DEFAULT_GREEDY_SPLIT_MODE, help=("Greedy split selection mode"))
+    p.add_argument("--proxy-caching", choices=["on", "off"], default=("on" if DEFAULT_PROXY_CACHING else "off"), help="Enable proxy caching during search")
 
     args = p.parse_args()
 
@@ -93,7 +93,7 @@ def main():
     X = df.iloc[:, :-1].to_numpy(dtype=np.uint8)
     y = df.iloc[:, -1].to_numpy(dtype=np.int32)
 
-    model = LicketyRESPLIT()
+    model = PRAXIS()
 
     rss_before = _peak_rss_bytes()
     t0 = time.perf_counter()
@@ -114,6 +114,7 @@ def main():
         majority_leaf_only=(args.majority_leaf == "on"),
         cache_cheap_subproblems=(args.cache_cheap == "on"),
         greedy_split_mode=args.greedy_split_mode,
+        proxy_caching=(args.proxy_caching == "on"),
     )
 
     t1 = time.perf_counter()
