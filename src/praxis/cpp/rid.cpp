@@ -226,7 +226,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             depth_budget,
             rashomon_mult,
             lookahead_k,
-            -1, true, false, 0, false, false, true, 0
+            -1, true, false, 0, false, false, true, 0, true
         );
 
         const uint64_t T64 = model.result ? model.result->count_trees() : 0ULL;

@@ -424,8 +424,8 @@ private:
     KeyMode key_mode = KeyMode::HASH64; // will change later in fit
     bool trie_cache_enabled = false;
     bool proxy_caching_enabled = true;
-    MaskIdTable mask_ids; // used only if in exact mode
-    LitIdTable lit_ids; // for itemset mode
+    mutable MaskIdTable mask_ids; // used only if in exact mode
+    mutable LitIdTable lit_ids; // for itemset mode
 
     int lookahead_init = 1; // will be changed later
     bool use_multipass = true; // sim
@@ -436,7 +436,7 @@ private:
     int num_proxy_features = -1; // <=0 means use all feature. positive for feature selection
 
     
-    int oracle_style = 0; // 0=constant k (current), 1=cyclic, 2=cyclic-consistent, 3=split
+    int oracle_style = 0; // 0=constant k (current), 1=cyclic (recursively applying split), 2=cyclic-consistent, 3=split without postprocessing, 4=split with postprocessing
     std::vector<int> k_at_depth; // size depth_budget (only used for style 2)
 
     unordered_map<K2, int, K2::Hash> greedy_cache;
@@ -464,7 +464,7 @@ private:
         return s;
     }
 
-    inline uint64_t key_of_mask(const Packed& mask) {
+    inline uint64_t key_of_mask(const Packed& mask) const {
         if (key_mode == KeyMode::LITS_EXACT) {
             throw std::runtime_error("key_of_mask called in LITS_EXACT mode; use key_of_state(mask, pk)");
         }
@@ -473,7 +473,7 @@ private:
 
 
 
-    inline uint64_t key_of_state(const Packed& mask, const PathKey& pk) {
+    inline uint64_t key_of_state(const Packed& mask, const PathKey& pk) const {
         switch (key_mode) {
             case KeyMode::HASH64:
                 return hash_mask64(mask.w.data(), n_words, tail_mask);
@@ -485,7 +485,7 @@ private:
         return 0;
     }
 
-    inline uint64_t key_of_subproblem(const Packed& mask, const PathKey& pk) {
+    inline uint64_t key_of_subproblem(const Packed& mask, const PathKey& pk) const {
         if (key_mode == KeyMode::LITS_EXACT) {
             return key_of_state(mask, pk); // interns pk
         } else {
@@ -564,7 +564,8 @@ public:
              bool majority_leaf_only_flag,
              bool cache_cheap_subproblems_flag,
              bool proxy_caching_flag,
-             int num_proxy_features_in
+             int num_proxy_features_in,
+             bool rashomon_mode
             ) {
         n_features = (int)X_col_major.size();
         n_samples  = (int)X_col_major[0].size();
@@ -602,6 +603,24 @@ public:
 
         const PathKey& root_pk = empty_pk();
 
+        // SINGLE TREE SUPPORT
+        if (!rashomon_mode) {
+            int single_obj = 0;
+            if (lookahead_init <= 0) {
+                single_obj = train_greedy(root, depth_budget, root_pk);
+            } else {
+                if (oracle_style == 4) {
+                    single_obj = split_algorithm(root, depth_budget, lookahead_init, root_pk);
+                } else {
+                    single_obj = lickety_split(root, depth_budget, lookahead_init, root_pk);
+                }
+            }
+
+            std::cout << "Single-tree objective: " << single_obj
+                    << " (" << (double)single_obj / (double)n_samples << ")\n";
+            return; // done; do NOT build trie or do rashomon things
+        }
+
         if (root_budget >= 0) {
             // user-specified bound: skip reference solution
             obj_bound = root_budget;
@@ -611,7 +630,11 @@ public:
             if (lookahead_init <= 0) { // set based on greedy even if our proxy is a leaf
                 best_objective = train_greedy(root, depth_budget, root_pk);
             } else {
-                best_objective = lickety_split(root, depth_budget, lookahead_init, root_pk);
+                if (oracle_style == 4) {
+                    best_objective = split_algorithm(root, depth_budget, lookahead_init, root_pk);
+                } else {
+                    best_objective = lickety_split(root, depth_budget, lookahead_init, root_pk);
+                }
             }
             cout << "Best objective: " << best_objective
                 << " (" << (double)best_objective / (double)n_samples << ")\n";
@@ -707,6 +730,22 @@ public:
         collect_paths(tree.get(), current, paths, preds);
         return {paths, preds};
     }
+
+    // for individual decision tree algorithm
+    std::pair<std::vector<std::vector<int>>, std::vector<int>>
+        get_tree_paths_from_tree(const std::shared_ptr<PredNode>& tree) const {
+            if (!tree) {
+                throw std::runtime_error("Null tree passed to get_tree_paths_from_tree.");
+            }
+
+            std::vector<std::vector<int>> paths;
+            std::vector<int> preds;
+            std::vector<int> current;
+
+            collect_paths(tree.get(), current, paths, preds);
+            return {paths, preds};
+        }
+
 
     // return (unnormalized_objective, normalized_objective) for the ith tree
     std::pair<int, double> get_ith_tree_objective(std::uint64_t i) const {
@@ -883,8 +922,13 @@ private:
                 lossL = train_greedy(L, depth - 1, *pkLp);
                 lossR = train_greedy(R, depth - 1, *pkRp);
             } else {
-                lossL = lickety_split(L, depth - 1, k_here, *pkLp);
-                lossR = lickety_split(R, depth - 1, k_here, *pkRp);
+                if (oracle_style == 4) {
+                    lossL = split_algorithm(L, depth - 1, k_here, *pkLp);
+                    lossR = split_algorithm(R, depth - 1, k_here, *pkRp);
+                } else {
+                    lossL = lickety_split(L, depth - 1, k_here, *pkLp);
+                    lossR = lickety_split(R, depth - 1, k_here, *pkRp);
+                }
             }
             if (!rule_list_mode) {
                 if (lossL + lossR > budget) continue; // approximation decision tree rashomon set
@@ -979,69 +1023,119 @@ private:
     
     }
 
+    // std::pair<std::shared_ptr<TreeTrieNode>, std::shared_ptr<TreeTrieNode>>
+    // rule_list_alloc(int loss_l, int loss_r,
+    //             const Packed& Lmask, const Packed& Rmask,
+    //             int budget, int8_t depth,
+    //             const PathKey& pkL, const PathKey& pkR) {
+    //     using std::shared_ptr;
+    //     const int INF = std::numeric_limits<int>::max();
+
+    //     int left_candidate  = budget - loss_r;
+    //     int right_candidate = budget - loss_l;
+
+    //     // if we can't even fit a leaf on either side, then we cannot yield a valid rule list
+    //     if (left_candidate < 0 && right_candidate < 0) {
+    //         return {nullptr, nullptr};
+    //     }
+
+    //     // decide which side to solve first:
+    //     // if only one is non-negative, use that one.
+    //     // if both are non-negative, pick the one with more candidate budget (doesn't matter)
+    //     // why do we need this? because rule lists put a leaf on one side. if putting one on one side would yield a negative budget for the other side, but putting a leaf on the other side wouldn't, then we know we put the leaf on that side and solve it first.
+    //     bool solve_left_first;
+    //     if (left_candidate >= 0 && right_candidate < 0) {
+    //         solve_left_first = true;
+    //     } else if (right_candidate >= 0 && left_candidate < 0) {
+    //         solve_left_first = false;
+    //     } else {
+    //         // both >= 0
+    //         solve_left_first = (left_candidate >= right_candidate);
+    //     }
+
+    //     shared_ptr<TreeTrieNode> left_node  = nullptr;
+    //     shared_ptr<TreeTrieNode> right_node = nullptr;
+
+    //     if (solve_left_first) {
+    //         int left_budget = left_candidate;
+    //         if (left_budget >= 0) {
+    //             left_node = construct_trie(Lmask, depth - 1, left_budget, pkL);
+    //             int min_left = left_node ? left_node->min_objective : INF;
+
+    //             // remaining budget for the right side is B - min_left to be more optimal than assuming leaf loss on left
+    //             //int right_budget = (min_left == INF) ? -1 : (budget - min_left);
+    //             int right_budget = (loss_l == INF) ? -1 : (budget - loss_l);
+    //             if (right_budget >= 0) {
+    //                 right_node = construct_trie(Rmask, depth - 1, right_budget, pkR);
+    //             }
+    //         }
+    //     } else {
+    //         int right_budget = right_candidate;
+    //         if (right_budget >= 0) {
+    //             right_node = construct_trie(Rmask, depth - 1, right_budget, pkR);
+    //             int min_right = right_node ? right_node->min_objective : INF;
+
+    //             //int left_budget = (min_right == INF) ? -1 : (budget - min_right);
+    //             int left_budget = (loss_r == INF) ? -1 : (budget - loss_r);
+    //             if (left_budget >= 0) {
+    //                 left_node = construct_trie(Lmask, depth - 1, left_budget, pkL);
+    //             }
+    //         }
+    //     }
+
+    //     return {left_node, right_node};
+    // }
+
     std::pair<std::shared_ptr<TreeTrieNode>, std::shared_ptr<TreeTrieNode>>
     rule_list_alloc(int loss_l, int loss_r,
-                const Packed& Lmask, const Packed& Rmask,
-                int budget, int8_t depth,
-                const PathKey& pkL, const PathKey& pkR) {
+                    const Packed& Lmask, const Packed& Rmask,
+                    int budget, int8_t depth,
+                    const PathKey& pkL, const PathKey& pkR) {
         using std::shared_ptr;
-        const int INF = std::numeric_limits<int>::max();
+        const int NEG_INF = std::numeric_limits<int>::min();
 
-        int left_candidate  = budget - loss_r;
-        int right_candidate = budget - loss_l;
+        // largest budgets actually tried so far - set as in paper
+        int epsL_tried = NEG_INF;
+        int epsR_tried = NEG_INF;
 
-        // if we can't even fit a leaf on either side, then we cannot yield a valid rule list
-        if (left_candidate < 0 && right_candidate < 0) {
-            return {nullptr, nullptr};
-        }
-
-        // decide which side to solve first:
-        // if only one is non-negative, use that one.
-        // if both are non-negative, pick the one with more candidate budget (doesn't matter)
-        // why do we need this? because rule lists put a leaf on one side. if putting one on one side would yield a negative budget for the other side, but putting a leaf on the other side wouldn't, then we know we put the leaf on that side and solve it first.
-        bool solve_left_first;
-        if (left_candidate >= 0 && right_candidate < 0) {
-            solve_left_first = true;
-        } else if (right_candidate >= 0 && left_candidate < 0) {
-            solve_left_first = false;
-        } else {
-            // both >= 0
-            solve_left_first = (left_candidate >= right_candidate);
-        }
+        // next budgets to try (initialized from proxies)
+        int epsL_next = budget - loss_r;  // eps_abs - P_R
+        int epsR_next = budget - loss_l;  // eps_abs - P_L
 
         shared_ptr<TreeTrieNode> left_node  = nullptr;
         shared_ptr<TreeTrieNode> right_node = nullptr;
 
-        if (solve_left_first) {
-            int left_budget = left_candidate;
-            if (left_budget >= 0) {
-                left_node = construct_trie(Lmask, depth - 1, left_budget, pkL);
-                int min_left = left_node ? left_node->min_objective : INF;
-
-                // remaining budget for the right side is B - min_left to be more optimal than assuming leaf loss on left
-                //int right_budget = (min_left == INF) ? -1 : (budget - min_left);
-                int right_budget = (loss_l == INF) ? -1 : (budget - loss_l);
-                if (right_budget >= 0) {
-                    right_node = construct_trie(Rmask, depth - 1, right_budget, pkR);
+        // ping-pong until we don't improve by the next iteration because we'd have no idea how to change the budgets upward
+        while (epsL_next > epsL_tried) {
+            // left
+            epsL_tried = epsL_next;
+            if (epsL_tried >= 0) {
+                left_node = construct_trie(Lmask, depth - 1, epsL_tried, pkL);
+                if (left_node) {
+                    int epsR_from_left = budget - left_node->min_objective;
+                    if (epsR_from_left > epsR_next) {
+                        epsR_next = epsR_from_left;
+                    }
                 }
             }
-        } else {
-            int right_budget = right_candidate;
-            if (right_budget >= 0) {
-                right_node = construct_trie(Rmask, depth - 1, right_budget, pkR);
-                int min_right = right_node ? right_node->min_objective : INF;
 
-                //int left_budget = (min_right == INF) ? -1 : (budget - min_right);
-                int left_budget = (loss_r == INF) ? -1 : (budget - loss_r);
-                if (left_budget >= 0) {
-                    left_node = construct_trie(Lmask, depth - 1, left_budget, pkL);
+            // right
+            if (epsR_next > epsR_tried) {
+                epsR_tried = epsR_next;
+                if (epsR_tried >= 0) {
+                    right_node = construct_trie(Rmask, depth - 1, epsR_tried, pkR);
+                    if (right_node) {
+                        int epsL_from_right = budget - right_node->min_objective;
+                        if (epsL_from_right > epsL_next) {
+                            epsL_next = epsL_from_right;
+                        }
+                    }
                 }
             }
         }
 
         return {left_node, right_node};
     }
-
 
     int leaf_objective(const Packed& mask) const {
         const int n_sub = count_total(mask);
@@ -1459,20 +1553,27 @@ private:
         //     int right_loss = lickety_split(bestR, depth_budget - 1);
         //     ans = left_loss + right_loss;
         // }
+        int ans = leaf_loss; 
+
         int8_t k_recurse;
         if (oracle_style == 0) {
             // style 0: constant k (recursively choosing based on lower tier LicketySPLIT)
             k_recurse = k;
         } else if (oracle_style == 3) {
-            // style 3: decrement by 1; when it hits 0, switch to greedy tail (SPLIT)
-            k_recurse = child_k; // child_k = k - 1 (already computed above)
+            // style 3: decrement by 1; when it hits 0, switch to greedy tail (SPLIT) - but we have already done that in our split selection - there is no reason to recurse.
+            ans = std::min(ans, best_sum);
+            if (proxy_caching_enabled) {
+                if (use_kla) lickety_cache_kla.emplace(keyla, ans);
+                else         lickety_cache_k2.emplace(key2,  ans);
+            }
+            return ans;
+            // k_recurse = child_k; // child_k = k - 1 (already computed above)
         } else {
-            // styles 1/2: restart when it hits (recursively applying SPLIT)
+            // styles 1/2: restart when it hits (recursively applying SPLIT): style 2 is not recommended, use style 1.
             k_recurse = (child_k == 0) ? lookahead_init : child_k;
         }
 
 
-        int ans = leaf_loss; 
         if (best_feat >= 0) {
             const int next_depth = depth_budget - 1;
 
@@ -1483,16 +1584,10 @@ private:
             PathKey pkL_local, pkR_local;
             make_child_pks_if_needed_(best_feat, pk, pkLp, pkRp, pkL_local, pkR_local);
 
-            if (oracle_style == 3 && k_recurse <= 0) {
-                // greedy tail once k runs out
-                left_loss  = train_greedy(bestL, next_depth, *pkLp);
-                right_loss = train_greedy(bestR, next_depth, *pkRp);
-            } else {
-                // normal lickety recursion (k might be <=0 for other oracle styles, but fine here)
-                left_loss  = lickety_split(bestL, next_depth, k_recurse, *pkLp);
-                right_loss = lickety_split(bestR, next_depth, k_recurse, *pkRp);
-            }
-
+     
+            // normal lickety recursion (k might be <=0 for other oracle styles, but fine here)
+            left_loss  = lickety_split(bestL, next_depth, k_recurse, *pkLp);
+            right_loss = lickety_split(bestR, next_depth, k_recurse, *pkRp);
             ans = std::min(ans, left_loss + right_loss); // do lickety even if leaf is better over greedy and see which is preferred
 
         }
@@ -1503,6 +1598,96 @@ private:
         
         return ans;
     }
+
+    // TODO: seems like there is a bug here for both speed and correctness
+    int split_algorithm(const Packed& mask, int8_t depth_budget, int8_t k, const PathKey& pk) {
+        if (depth_budget <= 0) return leaf_objective(mask);
+        if (k > depth_budget - 1) k = depth_budget - 1; // same amount of computation is optimal
+        if (k == depth_budget - 1) {
+            return depthd_exact_solver_cached(mask, depth_budget, pk);
+        }
+
+        // if lookahead is exhausted, switch to optimal at this remaining depth
+        if (k <= 0) {
+            return depthd_exact_solver_cached(mask, depth_budget, pk);
+        }
+
+        const int8_t child_d = (int8_t)(depth_budget - 1);
+        const int8_t child_k = (int8_t)(k - 1);
+
+        Packed L(n_words), R(n_words);
+
+        int best_feat = -1;
+        int best_score = std::numeric_limits<int>::max();
+
+        Packed bestL(n_words), bestR(n_words);
+        PathKey bestPkL, bestPkR;
+        bool have_best_pks = false;
+
+        const int F = proxy_feat_count_();
+        for (int f = 0; f < F; ++f) {
+            and_bits(mask, X_bits[f], L);
+            andnot_bits(mask, X_bits[f], R);
+            if (!L.any() || !R.any()) continue;
+
+            const PathKey* pkLp = &empty_pk();
+            const PathKey* pkRp = &empty_pk();
+            PathKey pkL_local, pkR_local;
+            make_child_pks_if_needed_(f, pk, pkLp, pkRp, pkL_local, pkR_local);
+
+            // choose the best split based on lickety_split at (d-1, k-1). with the strategy 3/4 (SPLIT algorithm), this is tracing out the splits that the SPLIT algorithm without postprocessing chose.
+            int left_score  = lickety_split(L, child_d, child_k, *pkLp);
+            int right_score = lickety_split(R, child_d, child_k, *pkRp);
+            int score = left_score + right_score;
+
+            if (score < best_score) {
+                best_score = score;
+                best_feat = f;
+
+                bestL.w = L.w;
+                bestR.w = R.w;
+
+                if (key_mode == KeyMode::LITS_EXACT) {
+                    bestPkL = *pkLp;
+                    bestPkR = *pkRp;
+                    have_best_pks = true;
+                } else {
+                    have_best_pks = false;
+                }
+            }
+        }
+
+        if (best_feat < 0) {
+            return leaf_objective(mask);
+        }
+
+        const PathKey* pkLp = &empty_pk();
+        const PathKey* pkRp = &empty_pk();
+        PathKey pkL_local, pkR_local;
+
+        if (key_mode == KeyMode::LITS_EXACT) {
+            if (have_best_pks) {
+                pkLp = &bestPkL;
+                pkRp = &bestPkR;
+            } else {
+                make_child_pks_if_needed_(best_feat, pk, pkLp, pkRp, pkL_local, pkR_local);
+            }
+        }
+
+        // instead of recursing with a greedy tree, we apply postprocessing here.
+        // we do optimal on the children because we chose a split that was already best for greedy completion (aka we are tracing out the top k splits of the SPLIT tree without postprocessing to then apply it)
+        if (child_k <= 0) {
+            int left_cost  = depthd_exact_solver_cached(bestL, child_d, *pkLp);
+            int right_cost = depthd_exact_solver_cached(bestR, child_d, *pkRp);
+            return left_cost + right_cost;
+        }
+
+        // otherwise recurse using split() itself to find the next split it made
+        int left_cost  = split_algorithm(bestL, child_d, child_k, *pkLp);
+        int right_cost = split_algorithm(bestR, child_d, child_k, *pkRp);
+        return left_cost + right_cost;
+    }
+
 
     int find_best_split(const Packed& mask, bool use_entropy) const {
         const int n_sub = count_total(mask);
@@ -1566,6 +1751,141 @@ private:
         }
     }
 
+    // not used by PRAXIS, to support giving single decision tree algorithm results in package.
+    shared_ptr<PredNode> build_best_tree_from_caches(const Packed& mask, int8_t depth_budget, const PathKey& pk) const {
+        const int INF = std::numeric_limits<int>::max();
+
+        const int n_sub = count_total(mask);
+        if (n_sub == 0) {
+            auto t = make_shared<PredNode>();
+            t->feature = -1;
+            t->prediction = 0;
+            return t;
+        }
+
+        const int pos = count_pos(mask);
+        const int mis0 = pos;
+        const int mis1 = n_sub - pos;
+        const int leaf_pred = (mis1 <= mis0) ? 1 : 0;
+        const int leaf_loss = lamN + std::min(mis0, mis1);
+
+        if (depth_budget <= 0) {
+            auto t = make_shared<PredNode>();
+            t->feature = -1;
+            t->prediction = leaf_pred;
+            return t;
+        }
+
+        // helper: lookup min cached objective for (mask, depth, pk) across greedy + lickety caches
+        auto best_cached_obj = [&](const Packed& m, int8_t d, const PathKey& pk_child) -> int {
+            if (d < 0) return 0;
+            if (!proxy_caching_enabled) return INF;
+
+            const uint64_t km = key_of_subproblem(m, pk_child);
+
+            int best = INF;
+
+            // greedy cache: (subproblem, depth)
+            {
+                auto itg = greedy_cache.find(K2{km, d});
+                if (itg != greedy_cache.end()) best = std::min(best, itg->second);
+            }
+
+            // lickety cache:
+            if (use_kla_cache()) {
+                // try all k = 0..d-1
+                for (int kk = 0; kk <= (int)(d-1); ++kk) {
+                    auto it = lickety_cache_kla.find(KLA{km, d, kk});
+                    if (it != lickety_cache_kla.end()) best = std::min(best, it->second);
+                }
+            } else {
+                // K2-form: no k needed
+                auto it = lickety_cache_k2.find(K2{km, d});
+                if (it != lickety_cache_k2.end()) best = std::min(best, it->second);
+            }
+
+            return best;
+        };
+
+        // choose best split using cached objectives
+        const int8_t child_d = (int8_t)(depth_budget - 1);
+
+        int best_feat = -1;
+        int best_sum  = INF;
+
+        Packed L(n_words), R(n_words), bestL(n_words), bestR(n_words);
+        PathKey bestPkL, bestPkR;
+        bool have_best_pks = false;
+
+        const int F = proxy_feat_count_();
+        for (int f = 0; f < F; ++f) {
+            and_bits(mask, X_bits[f], L);
+            andnot_bits(mask, X_bits[f], R);
+            if (!L.any() || !R.any()) continue;
+
+            const PathKey* pkLp = &empty_pk();
+            const PathKey* pkRp = &empty_pk();
+            PathKey pkL_local, pkR_local;
+            make_child_pks_if_needed_(f, pk, pkLp, pkRp, pkL_local, pkR_local);
+
+            const int left_obj  = best_cached_obj(L, child_d, *pkLp);
+            const int right_obj = best_cached_obj(R, child_d, *pkRp);
+            if (left_obj == INF || right_obj == INF) continue;
+
+            const int sum = left_obj + right_obj;
+            if (sum < best_sum) {
+                best_sum = sum;
+                best_feat = f;
+                bestL.w = L.w;
+                bestR.w = R.w;
+
+                if (key_mode == KeyMode::LITS_EXACT) {
+                    bestPkL = *pkLp;
+                    bestPkR = *pkRp;
+                    have_best_pks = true;
+                } else {
+                    have_best_pks = false;
+                }
+            }
+        }
+
+        // If no split is yielded or it doesn't beat leaf, return leaf.
+        if (best_feat < 0 || best_sum >= leaf_loss) {
+            auto t = make_shared<PredNode>();
+            t->feature = -1;
+            t->prediction = leaf_pred;
+            return t;
+        }
+
+        // --- recurse on chosen split ---
+        const PathKey* pkLp = &empty_pk();
+        const PathKey* pkRp = &empty_pk();
+        PathKey pkL_local, pkR_local;
+
+        if (key_mode == KeyMode::LITS_EXACT) {
+            if (have_best_pks) {
+                pkLp = &bestPkL;
+                pkRp = &bestPkR;
+            } else {
+                make_child_pks_if_needed_(best_feat, pk, pkLp, pkRp, pkL_local, pkR_local);
+            }
+        } else {
+            // non-literal mode: pk is ignored by key_of_subproblem anyway, so keep empty_pk()
+            pkLp = &empty_pk();
+            pkRp = &empty_pk();
+        }
+
+        auto left_tree  = build_best_tree_from_caches(bestL, child_d, *pkLp);
+        auto right_tree = build_best_tree_from_caches(bestR, child_d, *pkRp);
+
+        auto t = make_shared<PredNode>();
+        t->feature = best_feat;
+        t->prediction = -1;
+        t->left = left_tree;
+        t->right = right_tree;
+        return t;
+    }
+
     shared_ptr<PredNode> get_ith_tree(uint64_t i) const {
         if (!result) {
             throw runtime_error("No Rashomon trie has been constructed. Call fit() first.");
@@ -1597,7 +1917,7 @@ private:
         return get_kth_tree_with_objective(result.get(), target_obj, k_within);
     }
 
-        shared_ptr<PredNode> get_kth_tree_with_objective(const TreeTrieNode* node, int target_obj, uint64_t k) const {
+    shared_ptr<PredNode> get_kth_tree_with_objective(const TreeTrieNode* node, int target_obj, uint64_t k) const {
         if (!node) {
             throw runtime_error("Null node in get_kth_tree_with_objective");
         }

@@ -37,7 +37,8 @@ class PRAXIS:
         cache_cheap_subproblems=False,
         greedy_split_mode=1,
         proxy_caching=True,
-        num_proxy_features=0
+        num_proxy_features=0,
+        rashomon_mode=True,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -65,6 +66,7 @@ class PRAXIS:
             int(greedy_split_mode),
             bool(proxy_caching),
             int(num_proxy_features),
+            bool(rashomon_mode),
         )
 
     def count_trees(self):
