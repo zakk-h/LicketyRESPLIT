@@ -284,9 +284,6 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         if (T == 0) continue;
         cout << "Finished RID bootstrap: " << (b + 1) << " / " << n_bootstraps << " with " << T << " trees\n";
 
-        // weight per tree per bootstrap
-        const double wt_tree = 1.0 / ((double)n_bootstraps * (double)T64);
-
         // pre-sample permutations for each feature (one scramble per feature per bootstrap)
         std::vector<std::vector<int>> perms((size_t)V);
         for (int v = 0; v < V; ++v) make_permutation(n, rng, perms[(size_t)v]);
@@ -297,7 +294,12 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         const int budget_override = (int)llround((1.0 + rashomon_mult) * (double)model.result->min_objective);
         auto orig = model.get_all_predictions_packed_trie(Xb, budget_override);
         const uint64_t Tvec = (uint64_t)orig.size();
+
         if (Tvec == 0) continue;
+        
+        // weight per tree per bootstrap
+        const double wt_tree = 1.0 / ((double)n_bootstraps * (double)Tvec); // we may return more trees than we use (within new budget), so Tvec here
+
 
         std::vector<int> correct_orig((size_t)Tvec, 0);
         for (uint64_t t = 0; t < Tvec; ++t) {
@@ -312,8 +314,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             scramble_block_inplace(Xb, cols, perms[(size_t)v], saved_cols);
 
             auto scr = model.get_all_predictions_packed_trie(Xb, budget_override);
-            const uint64_t Tscr = (uint64_t)scr.size();
-            const uint64_t Tuse = std::min(Tvec, Tscr);
+            const uint64_t Tuse = Tvec;
 
             for (uint64_t t = 0; t < Tuse; ++t) {
                 const int correct_scr = count_correct_packed_multi(scr[(size_t)t].pred, y_bits, n_words, tail_mask);
