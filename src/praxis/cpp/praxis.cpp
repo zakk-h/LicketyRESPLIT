@@ -2186,11 +2186,11 @@ private:
     static inline Packed copy_eval_mask(const Packed& m, int n_words, uint64_t tail_mask) {
         Packed out((size_t)n_words);
         out.w = m.w; // vector copy
-        out.w[n_words - 1] &= tail_mask;
+        out.w[n_words - 1] &= tail_mask; // bitwise and
         return out;
     }
 
-    // build packed feature columns for EVAL X (row-major uint8 because predictions per row lend themselves to row major)
+    // build packed feature columns for EVAL X, turning into column major
     static inline EvalCtx build_eval_ctx_(const std::vector<std::vector<uint8_t>>& X_row_major, int n_features_expected) {
         EvalCtx ctx;
 
@@ -2245,7 +2245,7 @@ private:
         for (auto &kv : acc) {
             ObjBucket b;
             b.obj = kv.first;
-            b.preds = std::move(kv.second);
+            b.preds = std::move(kv.second); // vector of prediction vectors
             out.push_back(std::move(b));
         }
         std::sort(out.begin(), out.end(), [](const ObjBucket& a, const ObjBucket& b){ return a.obj < b.obj; });
@@ -2306,7 +2306,7 @@ private:
             int bR = budget - minL;
             if (bL < 0 || bR < 0) continue;
 
-            // also cap by the budgets actually used to build those trie nodes. should never change anything.
+            // also cap by the budgets actually used to build those trie nodes. should never change anything (assuming we do iterative budget refinement, otherwise this is needed for tightening).
             bL = std::min(bL, L->budget);
             bR = std::min(bR, R->budget);
 
@@ -2330,27 +2330,27 @@ private:
                 if (lo > budget) break;
                 const int rem = budget - lo; // how far do we have to look
 
-                while (r_hi < Rb.size() && Rb[r_hi].obj <= rem) ++r_hi; // never look past the remainder because RHS is also sorted
+                while (r_hi < Rb.size() && Rb[r_hi].obj <= rem) ++r_hi; // getting the first invalid index. never look past the remainder because RHS is also sorted
                 if (r_hi == 0) continue; // no right objs fit
 
                 // cross product (filtered)
                 for (size_t ri = 0; ri < r_hi; ++ri) { // r_hi is one past the last valid
-                    const int ro = Rb[ri].obj;
-                    const int tot = lo + ro;
+                    const int ro = Rb[ri].obj; // objective value for that bucket
+                    const int tot = lo + ro; // additivity of objectives
 
                     // combine each left pred with each right pred (disjoint masks so OR is correct)
                     const auto& Lpreds = Lb[li].preds;
                     const auto& Rpreds = Rb[ri].preds;
 
                     // reserve some space in this objective bucket to reduce reallocs
-                    auto &dest = acc[tot];
+                    auto &dest = acc[tot]; // alias for simplicity
                     // rough reserve: only if currently empty
                     if (dest.empty()) {
                             dest.reserve(std::max(Lpreds.size(), Rpreds.size()));
                         }
 
 
-                    for (const auto& lp : Lpreds) {
+                    for (const auto& lp : Lpreds) { // because these are bucketed, each lp and rp is an individual prediction vector for that objective
                         for (const auto& rp : Rpreds) {
                             Packed comb((size_t)ctx.n_words);
                             if (ctx.n_words > 0) {

@@ -253,7 +253,10 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         for (uint64_t t = 0; t < Tvec; ++t) {
             correct_orig[(size_t)t] = count_correct_packed(orig[(size_t)t].pred1, y1, n_words, tail_mask);
         }
-
+    
+        // Consider this optimization: convert the bootstrap to column major once, and scramble the columns in column major (which is probably slightly slower), and then replace get_all_predictions_packed_trie to take in column major instead of taking in row and converting to column.
+        // I think precomputing column major once instead of f times is better, even if it is not ideal for the scrambling.
+        
         for (int v = 0; v < V; ++v) {
             const std::vector<int>& cols = var_cols[(size_t)v];
             scramble_block_inplace(Xb, cols, perms[(size_t)v], saved_cols);
