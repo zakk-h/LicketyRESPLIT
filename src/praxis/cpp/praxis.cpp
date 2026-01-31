@@ -89,6 +89,20 @@ static inline void pk_erase_sorted(PathKey& pk, Lit lit) {
     pk.erase(it);
 }
 
+struct PackedPredMulti {
+    std::vector<Packed> by_class; // size = num_classes, each is n_words over eval rows
+};
+
+// bucket by objective
+struct ObjBucketMulti {
+    int obj;
+    std::vector<PackedPredMulti> preds; // one entry per tree at this objective
+};
+
+struct PredPackWithObj {
+    int obj;
+    PackedPredMulti pred;
+};
 
 // used for exact, non-probabilistic keyks at the expense of more memory. we intern the exact bytes of a mask/bitvector and assign a small integer ID.
 // first unique mask id 0, second unique mask id 1 and so on.
@@ -389,10 +403,10 @@ struct PredNode {
 };
 
 // for joint rashomon set prediction / rid
-struct ObjBucket {
-    int obj;
-    std::vector<Packed> preds; // each is a prediction bitvector for one tree at this obj. predictions for all trees with an objective.
-};
+// struct ObjBucket {
+//     int obj;
+//     std::vector<Packed> preds; // each is a prediction bitvector for one tree at this obj. predictions for all trees with an objective.
+// };
 
 struct EvalCtx {
     int n_eval = 0;
@@ -419,7 +433,10 @@ private:
     double multiplicative_slack = 0.0;
 
     vector<Packed> X_bits; // vector of Packed, each Packed is a feature column. packed is a sequence of 64-bit words where each bit corresponds to the row value for the column
-    Packed Ypos; // each bit of a word is the label for the row
+    // Packed Ypos; // each bit of a word is the label for the row
+    int num_classes = 0;
+    std::vector<Packed> Y_bits; // vector is size size num_classes; Y_bits[c] has 1s where y==c
+
 
     KeyMode key_mode = KeyMode::HASH64; // will change later in fit
     bool trie_cache_enabled = false;
@@ -501,13 +518,39 @@ private:
     inline bool use_kla_cache() const { return lookahead_init > 1; }
     
     inline int count_total(const Packed& mask) const { return mask.count(); } // number of active samples
-    inline int count_pos(const Packed& mask) const { return popcount_and(mask, Ypos); } // number of active samples that are positive
+    // inline int count_pos(const Packed& mask) const { return popcount_and(mask, Ypos); } // number of active samples that are positive
+
+    inline void count_per_class(const Packed& mask, std::vector<int>& counts) const {
+        counts.assign((size_t)num_classes, 0);
+        for (int c = 0; c < num_classes; ++c) {
+            counts[(size_t)c] = popcount_and(mask, Y_bits[(size_t)c]);
+        }
+    }
+
+    inline int count_class(const Packed& mask, int c) const {
+        return popcount_and(mask, Y_bits[(size_t)c]);
+    }
+
 
     static inline double entropy(double p) {
         const double eps = 1e-12;
         p = max(eps, min(1.0 - eps, p));
         return -(p * log2(p) + (1.0 - p) * log2(1.0 - p));
     }
+
+    static inline double entropy_multiclass(const std::vector<int>& cnts, int n) {
+        if (n <= 0) return 0.0;
+        const double invn = 1.0 / (double)n;
+        double H = 0.0;
+        for (int c = 0; c < (int)cnts.size(); ++c) {
+            const int k = cnts[(size_t)c];
+            if (k <= 0) continue;
+            const double p = (double)k * invn;
+            H -= p * log2(p);
+        }
+        return H;
+    }
+
 
     // count the distinct subproblems/bitvectors/literals/fingerprints, not considering depth or greedy/lickety
     size_t count_distinct_subproblems_union() const {
@@ -591,11 +634,27 @@ public:
             col[n_words-1] &= tail_mask; // bitwise and to 0 out invalid
         }
 
-        Ypos = Packed(n_words);
-        for (int i = 0; i < n_samples; ++i) {
-            if (y[i]) Ypos.w[i>>6] |= (1ULL << (i & 63));
+        // Ypos = Packed(n_words);
+        // for (int i = 0; i < n_samples; ++i) {
+        //     if (y[i]) Ypos.w[i>>6] |= (1ULL << (i & 63));
+        // }
+        // Ypos.w[n_words-1] &= tail_mask;
+        int y_max = 0;
+        for (int i = 0; i < n_samples; ++i) y_max = std::max(y_max, y[i]);
+        num_classes = y_max + 1;
+
+        Y_bits.assign((size_t)num_classes, Packed(n_words));
+        for (int c = 0; c < num_classes; ++c) {
+            Y_bits[(size_t)c].clear();
         }
-        Ypos.w[n_words-1] &= tail_mask;
+
+        for (int i = 0; i < n_samples; ++i) {
+            const int yi = y[i];
+            Y_bits[(size_t)yi].w[(size_t)(i >> 6)] |= (1ULL << (i & 63));
+        }
+        for (int c = 0; c < num_classes; ++c) {
+            Y_bits[(size_t)c].w[(size_t)(n_words - 1)] &= tail_mask;
+        }
 
         Packed root(n_words);
         for (int i = 0; i < n_words-1; ++i) root.w[i] = ~0ULL; // not 0, so all 1.
@@ -845,38 +904,32 @@ private:
         node->budget = budget;
 
         const int n_sub = count_total(mask);
-        if (n_sub == 0) {
-            return node;
-        }
-
-        const int pos = count_pos(mask);
 
         // braces make temporary local scope so variables created will cease to persist
-        // {
-        //     int mis0 = pos;
-        //     int mis1 = n_sub - pos;
-        //     int cost0 = lamN + mis0;
-        //     int cost1 = lamN + mis1;
-        //     if (cost0 <= budget) node->add_leaf(0, cost0);
-        //     if (cost1 <= budget) node->add_leaf(1, cost1);
-        // }
-
         {
-            int mis0 = pos;
-            int mis1 = n_sub - pos;
+            std::vector<int> cnts;
+            count_per_class(mask, cnts);
 
             if (!majority_leaf_only) {
-                int cost0 = lamN + mis0;
-                int cost1 = lamN + mis1;
-                if (cost0 <= budget) node->add_leaf(0, cost0);
-                if (cost1 <= budget) node->add_leaf(1, cost1);
+                for (int c = 0; c < num_classes; ++c) {
+                    const int mis = n_sub - cnts[(size_t)c];
+                    const int cost = lamN + mis;
+                    if (cost <= budget) node->add_leaf(c, cost);
+                }
             } else {
-                // choose the majority-label leaf (i.e., the one with fewer misclassifications)
-                // tie-break rule: predict 1 when mis0 == mis1
-                int pred = (mis1 <= mis0) ? 1 : 0;
-                int best_mis = std::min(mis0, mis1);
-                int best_cost = lamN + best_mis;
-                if (best_cost <= budget) node->add_leaf(pred, best_cost);
+                // choose argmax class 
+                int best_c = 0;
+                int best_cnt = cnts[0];
+                for (int c = 1; c < num_classes; ++c) {
+                    const int v = cnts[(size_t)c];
+                    if (v > best_cnt || (v == best_cnt && c > best_c)) {
+                        best_cnt = v;
+                        best_c = c;
+                    }
+                }
+                const int mis = n_sub - best_cnt;
+                const int best_cost = lamN + mis;
+                if (best_cost <= budget) node->add_leaf(best_c, best_cost);
             }
         }
 
@@ -1137,11 +1190,23 @@ private:
         return {left_node, right_node};
     }
 
+    // int leaf_objective(const Packed& mask) const {
+    //     const int n_sub = count_total(mask);
+    //     if (n_sub == 0) return 0; // should not really happen
+    //     const int pos = count_pos(mask);
+    //     return lamN + min(pos, n_sub - pos);
+    // }
+
     int leaf_objective(const Packed& mask) const {
         const int n_sub = count_total(mask);
-        if (n_sub == 0) return 0; // should not really happen
-        const int pos = count_pos(mask);
-        return lamN + min(pos, n_sub - pos);
+        if (n_sub == 0) return 0;
+
+        int best_cnt = 0;
+        for (int c = 0; c < num_classes; ++c) {
+            best_cnt = std::max(best_cnt, count_class(mask, c));
+        }
+        const int mis = n_sub - best_cnt;
+        return lamN + mis;
     }
 
     inline void make_child_pks_if_needed_(
@@ -1184,14 +1249,7 @@ private:
             if (auto it = greedy_cache.find(key); it != greedy_cache.end()) return it->second;
         }
 
-
-        const int n_sub = count_total(mask);
-        if (n_sub == 0) {
-            return 0; // should never happen
-        }
-
-        const int pos = count_pos(mask);
-        const int leaf_loss = lamN + min(pos, n_sub - pos);
+        const int leaf_loss = leaf_objective(mask);
 
         if (leaf_loss <= 2 * lamN) {
             if (cache_cheap_subproblems && proxy_caching_enabled) 
@@ -1268,14 +1326,7 @@ private:
             if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
         }
 
-
-        const int n_sub = count_total(mask);
-        if (n_sub == 0) {
-            return 0;
-        }
-
-        const int pos = count_pos(mask);
-        const int leaf_loss = lamN + std::min(pos, n_sub - pos);
+        const int leaf_loss = leaf_objective(mask);
 
         // only cache cheap subproblems if flag enabled
         if (leaf_loss <= 2 * lamN) {
@@ -1325,14 +1376,7 @@ private:
             if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
         }
 
-
-        const int n_sub = count_total(mask);
-        if (n_sub == 0) {
-            return 0;
-        }
-
-        const int pos = count_pos(mask);
-        const int leaf_loss = lamN + std::min(pos, n_sub - pos);
+        const int leaf_loss = leaf_objective(mask);
 
         if (leaf_loss <= 2 * lamN) {
             if (proxy_caching_enabled) {
@@ -1392,14 +1436,7 @@ private:
             if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
         }
 
-
-        const int n_sub = count_total(mask);
-        if (n_sub == 0) {
-            return 0;
-        }
-
-        const int pos = count_pos(mask);
-        const int leaf_loss = lamN + std::min(pos, n_sub - pos);
+        const int leaf_loss = leaf_objective(mask);
 
         if (leaf_loss <= 2 * lamN) {
             if (proxy_caching_enabled) {
@@ -1506,10 +1543,7 @@ private:
             }
         }
 
-
-        const int n_sub = count_total(mask);
-        const int pos   = count_pos(mask);
-        const int leaf_loss = lamN + min(pos, n_sub - pos);
+        const int leaf_loss = leaf_objective(mask);
         if (leaf_loss <= 2 * lamN) {
             if (cache_cheap_subproblems && proxy_caching_enabled) {
                 if (use_kla) lickety_cache_kla.emplace(keyla, leaf_loss);
@@ -1696,34 +1730,50 @@ private:
         Packed L(n_words);
 
         if (use_entropy) {
-            const int pos_total = count_pos(mask);
-            const double p0 = (double)pos_total / (double)n_sub;
-            const double baseH = entropy(p0);
+            // total class counts under mask
+            std::vector<int> total_cnt((size_t)num_classes, 0);
+            for (int c = 0; c < num_classes; ++c) {
+                total_cnt[(size_t)c] = popcount_and(mask, Y_bits[(size_t)c]);
+            }
+            const double baseH = entropy_multiclass(total_cnt, n_sub);
 
             int best_f = -1;
             double best_gain = -1e300;
 
+            std::vector<int> left_cnt((size_t)num_classes, 0);
+            std::vector<int> right_cnt((size_t)num_classes, 0);
+
             const int F = proxy_feat_count_();
             for (int f = 0; f < F; ++f) {
-                for (int i = 0; i < n_words; ++i) L.w[i] = mask.w[i] & X_bits[f].w[i];
-                L.w[n_words-1] &= tail_mask;
+                // L = mask & X_bits[f]
+                for (int i = 0; i < n_words; ++i) L.w[i] = mask.w[i] & X_bits[(size_t)f].w[i];
+                L.w[n_words - 1] &= tail_mask;
 
-                const int left_n = L.count();
+                const int left_n  = L.count();
                 const int right_n = n_sub - left_n;
                 if (left_n == 0 || right_n == 0) continue;
 
-                const int left_pos  = popcount_and(L, Ypos);
-                const int right_pos = pos_total - left_pos;
+                // left class counts: popcount_and(L, Y_bits[c])
+                for (int c = 0; c < num_classes; ++c) {
+                    left_cnt[(size_t)c] = popcount_and(L, Y_bits[(size_t)c]);
+                }
+
+                // right class counts = total - left (no need to build)
+                for (int c = 0; c < num_classes; ++c) {
+                    right_cnt[(size_t)c] = total_cnt[(size_t)c] - left_cnt[(size_t)c];
+                }
 
                 const double wl = (double)left_n  / (double)n_sub;
                 const double wr = (double)right_n / (double)n_sub;
-                const double pl = (double)left_pos  / (double)left_n;
-                const double pr = (double)right_pos / (double)right_n;
 
-                const double gain = baseH - (wl*entropy(pl) + wr*entropy(pr));
+                const double Hl = entropy_multiclass(left_cnt,  left_n);
+                const double Hr = entropy_multiclass(right_cnt, right_n);
+
+                const double gain = baseH - (wl * Hl + wr * Hr);
                 if (gain > best_gain) { best_gain = gain; best_f = f; }
             }
             return best_f;
+
         } else {
             // minimize child leaf objectives: leaf_objective(L)+leaf_objective(R)
             int best_f = -1;
@@ -1763,11 +1813,25 @@ private:
             return t;
         }
 
-        const int pos = count_pos(mask);
-        const int mis0 = pos;
-        const int mis1 = n_sub - pos;
-        const int leaf_pred = (mis1 <= mis0) ? 1 : 0;
-        const int leaf_loss = lamN + std::min(mis0, mis1);
+        // const int pos = count_pos(mask);
+        // const int mis0 = pos;
+        // const int mis1 = n_sub - pos;
+        // const int leaf_pred = (mis1 <= mis0) ? 1 : 0;
+        // const int leaf_loss = lamN + std::min(mis0, mis1);
+        std::vector<int> cnts;
+        count_per_class(mask, cnts);
+        int best_c = 0;
+        int best_cnt = cnts[0];
+        for (int c = 1; c < num_classes; ++c) {
+            int v = cnts[(size_t)c];
+            if (v > best_cnt || (v == best_cnt && c > best_c)) {
+                best_cnt = v;
+                best_c = c;
+            }
+        }
+        const int leaf_pred = best_c;
+        const int mis = n_sub - best_cnt;
+        const int leaf_loss = lamN + mis;
 
         if (depth_budget <= 0) {
             auto t = make_shared<PredNode>();
@@ -2149,10 +2213,11 @@ private:
 
 // whole trie prediction for RID
 
-struct PredPackWithObj {
-    int obj;     // training objective (lamN*leaves + miscls)
-    Packed pred1; // bitset over the evaluation dataset rows: 1 iff prediction == 1
-};
+// struct PredPackWithObj {
+//     int obj;     // training objective (lamN*leaves + miscls)
+//     Packed pred1; // bitset over the evaluation dataset rows: 1 iff prediction == 1
+// };
+
 
 private:
     static inline void and_bits_eval(const Packed& a, const Packed& b, Packed& out, int n_words, uint64_t tail_mask) {
@@ -2180,7 +2245,7 @@ private:
     }
 
     static inline Packed zeros_eval(int n_words) {
-        return Packed((size_t)n_words); // ctor zeros words
+        return Packed((size_t)n_words); // zeros words
     }
 
     static inline Packed copy_eval_mask(const Packed& m, int n_words, uint64_t tail_mask) {
@@ -2189,6 +2254,42 @@ private:
         out.w[n_words - 1] &= tail_mask; // bitwise and
         return out;
     }
+
+    static inline PackedPredMulti zeros_predmulti(int n_words, int num_classes) {
+        PackedPredMulti pm;
+        pm.by_class.reserve((size_t)num_classes);
+        for (int c = 0; c < num_classes; ++c) {
+            pm.by_class.emplace_back(Packed((size_t)n_words)); // zeros by constructor
+        }
+        return pm;
+    }
+
+    static inline void clear_predmulti(PackedPredMulti& pm) {
+        for (auto& p : pm.by_class) {
+            std::fill(p.w.begin(), p.w.end(), 0ULL);
+        }
+    }
+
+    // OR-combine two multiclass prediction packs into out
+    static inline void or_predmulti(
+        const PackedPredMulti& a,
+        const PackedPredMulti& b,
+        PackedPredMulti& out,
+        int n_words,
+        uint64_t tail_mask
+    ) {
+        const int C = (int)a.by_class.size();
+        for (int c = 0; c < C; ++c) {
+            auto& ow = out.by_class[(size_t)c].w;
+            const auto& aw = a.by_class[(size_t)c].w;
+            const auto& bw = b.by_class[(size_t)c].w;
+            for (int w = 0; w < n_words; ++w) {
+                ow[(size_t)w] = aw[(size_t)w] | bw[(size_t)w];
+            }
+            if (n_words > 0) ow[(size_t)(n_words - 1)] &= tail_mask;
+        }
+    }
+
 
     // build packed feature columns for EVAL X, turning into column major
     static inline EvalCtx build_eval_ctx_(const std::vector<std::vector<uint8_t>>& X_row_major, int n_features_expected) {
@@ -2237,23 +2338,40 @@ private:
     // convert unordered_map<int, vector<Packed>> -> sorted vector<ObjBucket>
     // before, map objective to lists of predictions
     // after conversion, it is a list of objective-bucket objects, each of which stores the list of predictions for all trees with that objective
-    static inline std::vector<ObjBucket> to_sorted_buckets_(
-        std::unordered_map<int, std::vector<Packed>>& acc
+    // static inline std::vector<ObjBucket> to_sorted_buckets_(
+    //     std::unordered_map<int, std::vector<Packed>>& acc
+    // ) {
+    //     std::vector<ObjBucket> out;
+    //     out.reserve(acc.size());
+    //     for (auto &kv : acc) {
+    //         ObjBucket b;
+    //         b.obj = kv.first;
+    //         b.preds = std::move(kv.second); // vector of prediction vectors
+    //         out.push_back(std::move(b));
+    //     }
+    //     std::sort(out.begin(), out.end(), [](const ObjBucket& a, const ObjBucket& b){ return a.obj < b.obj; });
+    //     return out;
+    // }
+
+    static inline std::vector<ObjBucketMulti> to_sorted_buckets_multi_(
+        std::unordered_map<int, std::vector<PackedPredMulti>>& acc
     ) {
-        std::vector<ObjBucket> out;
+        std::vector<ObjBucketMulti> out;
         out.reserve(acc.size());
         for (auto &kv : acc) {
-            ObjBucket b;
+            ObjBucketMulti b;
             b.obj = kv.first;
-            b.preds = std::move(kv.second); // vector of prediction vectors
+            b.preds = std::move(kv.second);
             out.push_back(std::move(b));
         }
-        std::sort(out.begin(), out.end(), [](const ObjBucket& a, const ObjBucket& b){ return a.obj < b.obj; });
+        std::sort(out.begin(), out.end(),
+                [](const ObjBucketMulti& a, const ObjBucketMulti& b){ return a.obj < b.obj; });
         return out;
     }
 
+
     // core recursion: returns buckets of predictions grouped by objective for ALL trees rooted at node with obj <= budget.
-    std::vector<ObjBucket> collect_preds_by_obj_(
+    std::vector<ObjBucketMulti> collect_preds_by_obj_(
         const TreeTrieNode* node,
         int budget,
         const Packed& eval_mask, // does not decrease size, just gets sparser
@@ -2266,7 +2384,8 @@ private:
         if (node->min_objective > budget) return {};
 
         // accumulate as obj (training) -> list of preds on evaluation (Packed)
-        std::unordered_map<int, std::vector<Packed>> acc;
+        //std::unordered_map<int, std::vector<Packed>> acc;
+        std::unordered_map<int, std::vector<PackedPredMulti>> acc;
         // heuristic reserve
         const int max_objs = budget - node->min_objective + 1;
         acc.reserve((size_t)std::max(1, max_objs));
@@ -2275,18 +2394,18 @@ private:
         for (const auto& leaf : node->leaves) {
             if (leaf.loss > budget) continue;
 
-            Packed p((size_t)ctx.n_words);
+            PackedPredMulti pm = zeros_predmulti(ctx.n_words, num_classes);
+
             if (ctx.n_words > 0) {
-                if (leaf.prediction == 1) {
-                    p.w = eval_mask.w; // pred=1 on this subset
-                    p.w[(size_t)(ctx.n_words - 1)] &= ctx.tail_mask;
-                } else {
-                    // pred=0 -> all zeros
-                    clear_eval(p);
-                }
+                // predicted class gets eval_mask, others stay zero
+                const int pc = leaf.prediction; // should be 0..num_classes-1
+                pm.by_class[(size_t)pc].w = eval_mask.w;
+                pm.by_class[(size_t)pc].w[(size_t)(ctx.n_words - 1)] &= ctx.tail_mask;
             }
 
-            acc[leaf.loss].push_back(std::move(p)); // storing the predictions in the map with that objective.
+            acc[leaf.loss].push_back(std::move(pm));
+            
+            // storing the predictions in the map with that objective.
         }
 
         // splits
@@ -2350,24 +2469,34 @@ private:
                         }
 
 
-                    for (const auto& lp : Lpreds) { // because these are bucketed, each lp and rp is an individual prediction vector for that objective
+                    // for (const auto& lp : Lpreds) { // because these are bucketed, each lp and rp is an individual prediction vector for that objective
+                    //     for (const auto& rp : Rpreds) {
+                    //         Packed comb((size_t)ctx.n_words);
+                    //         if (ctx.n_words > 0) {
+                    //             // comb = lp | rp
+                    //             for (int w = 0; w < ctx.n_words; ++w) {
+                    //                 comb.w[(size_t)w] = lp.w[(size_t)w] | rp.w[(size_t)w]; // OR, combining where 1. 0s will stay 0 which is fine. if they were predicted 0 they'll never change, if they are not set yet they'll change eventually.
+                    //             }
+                    //             comb.w[(size_t)(ctx.n_words - 1)] &= ctx.tail_mask;
+                    //         }
+                    //         dest.push_back(std::move(comb));
+                    //     }
+                    // }
+                    for (const auto& lp : Lpreds) {
                         for (const auto& rp : Rpreds) {
-                            Packed comb((size_t)ctx.n_words);
+                            PackedPredMulti comb = zeros_predmulti(ctx.n_words, num_classes);
                             if (ctx.n_words > 0) {
-                                // comb = lp | rp
-                                for (int w = 0; w < ctx.n_words; ++w) {
-                                    comb.w[(size_t)w] = lp.w[(size_t)w] | rp.w[(size_t)w]; // OR, combining where 1. 0s will stay 0 which is fine. if they were predicted 0 they'll never change, if they are not set yet they'll change eventually.
-                                }
-                                comb.w[(size_t)(ctx.n_words - 1)] &= ctx.tail_mask;
+                                or_predmulti(lp, rp, comb, ctx.n_words, ctx.tail_mask);
                             }
                             dest.push_back(std::move(comb));
                         }
                     }
+
                 }
             }
         }
 
-        return to_sorted_buckets_(acc);
+        return to_sorted_buckets_multi_(acc);
     }
 
 public:

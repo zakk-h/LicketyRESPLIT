@@ -23,34 +23,80 @@ static inline uint64_t popcnt64_u(uint64_t x) {
 }
 
 // build y==1 bitset for eval dataset (size n, in n_words words)
-static inline Packed build_y1_packed(const std::vector<int>& y, int n_words, uint64_t tail_mask) {
-    Packed y1((size_t)n_words);
+// static inline Packed build_y1_packed(const std::vector<int>& y, int n_words, uint64_t tail_mask) {
+//     Packed y1((size_t)n_words);
+//     for (int i = 0; i < (int)y.size(); ++i) {
+//         if (y[i]) y1.w[(size_t)(i >> 6)] |= (1ULL << (i & 63));
+//     }
+//     if (n_words > 0) y1.w[(size_t)(n_words - 1)] &= tail_mask;
+//     return y1;
+// }
+
+// y_bits[c] has bit i = 1 iff y[i] == c
+static inline std::vector<Packed> build_yc_packed(
+    const std::vector<int>& y,
+    int n_classes,
+    int n_words,
+    uint64_t tail_mask
+) {
+    std::vector<Packed> y_bits;
+    y_bits.reserve((size_t)n_classes);
+    for (int c = 0; c < n_classes; ++c) y_bits.emplace_back((size_t)n_words);
+
     for (int i = 0; i < (int)y.size(); ++i) {
-        if (y[i]) y1.w[(size_t)(i >> 6)] |= (1ULL << (i & 63));
+        const int c = y[i];
+        // (optional) assert 0 <= c < n_classes
+        y_bits[(size_t)c].w[(size_t)(i >> 6)] |= (1ULL << (i & 63));
     }
-    if (n_words > 0) y1.w[(size_t)(n_words - 1)] &= tail_mask;
-    return y1;
+
+    if (n_words > 0) {
+        for (int c = 0; c < n_classes; ++c) {
+            y_bits[(size_t)c].w[(size_t)(n_words - 1)] &= tail_mask;
+        }
+    }
+    return y_bits;
 }
 
 // count correct predictions given pred1 bitset and y1 bitset.
 // pred1 bit i = 1 iff prediction==1 on row i.
-static inline int count_correct_packed(const Packed& pred1, const Packed& y1, int n_words, uint64_t tail_mask) {
+// static inline int count_correct_packed(const Packed& pred1, const Packed& y1, int n_words, uint64_t tail_mask) {
+//     uint64_t correct = 0;
+//     for (int w = 0; w < n_words; ++w) {
+//         uint64_t p = pred1.w[(size_t)w];
+//         uint64_t y = y1.w[(size_t)w];
+
+//         // correct bits = (p & y) | (~p & ~y)
+//         uint64_t c = (p & y) | (~p & ~y);
+
+//         // mask tail on last word
+//         if (w == n_words - 1) c &= tail_mask;
+
+//         correct += popcnt64_u(c);
+//     }
+//     return (int)correct;
+// }
+
+static inline int count_correct_packed_multi(
+    const PackedPredMulti& pred,
+    const std::vector<Packed>& y_bits,
+    int n_words,
+    uint64_t tail_mask
+) {
+    const int C = (int)y_bits.size();
     uint64_t correct = 0;
-    for (int w = 0; w < n_words; ++w) {
-        uint64_t p = pred1.w[(size_t)w];
-        uint64_t y = y1.w[(size_t)w];
 
-        // correct bits = (p & y) | (~p & ~y)
-        uint64_t c = (p & y) | (~p & ~y);
+    for (int c = 0; c < C; ++c) {
+        const auto& pw = pred.by_class[(size_t)c].w;
+        const auto& yw = y_bits[(size_t)c].w;
 
-        // mask tail on last word
-        if (w == n_words - 1) c &= tail_mask;
-
-        correct += popcnt64_u(c);
+        for (int w = 0; w < n_words; ++w) {
+            uint64_t bits = pw[(size_t)w] & yw[(size_t)w];
+            if (w == n_words - 1) bits &= tail_mask;
+            correct += popcnt64_u(bits);
+        }
     }
     return (int)correct;
 }
-
 
 
 
@@ -212,7 +258,11 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         const int n = (int)Xb.size();
         const int n_words = (n + 63) / 64;
         const uint64_t tail_mask = (n % 64) ? ((1ULL << (n % 64)) - 1ULL) : ~0ULL;
-        const Packed y1 = build_y1_packed(yb, n_words, tail_mask);
+        int y_max = 0;
+        for (int i = 0; i < (int)yb.size(); ++i) y_max = std::max(y_max, yb[i]);
+        const int n_classes = y_max + 1;
+
+        const auto y_bits = build_yc_packed(yb, n_classes, n_words, tail_mask);
 
         // row-major -> col-major bool for training
         std::vector<std::vector<bool>> Xcol;
@@ -251,7 +301,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
 
         std::vector<int> correct_orig((size_t)Tvec, 0);
         for (uint64_t t = 0; t < Tvec; ++t) {
-            correct_orig[(size_t)t] = count_correct_packed(orig[(size_t)t].pred1, y1, n_words, tail_mask);
+            correct_orig[(size_t)t] = count_correct_packed_multi(orig[(size_t)t].pred, y_bits, n_words, tail_mask);
         }
     
         // Consider this optimization: convert the bootstrap to column major once, and scramble the columns in column major (which is probably slightly slower), and then replace get_all_predictions_packed_trie to take in column major instead of taking in row and converting to column.
@@ -266,7 +316,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             const uint64_t Tuse = std::min(Tvec, Tscr);
 
             for (uint64_t t = 0; t < Tuse; ++t) {
-                const int correct_scr = count_correct_packed(scr[(size_t)t].pred1, y1, n_words, tail_mask);
+                const int correct_scr = count_correct_packed_multi(scr[(size_t)t].pred, y_bits, n_words, tail_mask);
                 const int delta_correct = correct_orig[(size_t)t] - correct_scr;
 
                 out.mean_sub_mr[v] += wt_tree * ((double)delta_correct / (double)n);
